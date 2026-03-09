@@ -10,6 +10,7 @@ import string
 import json
 import os
 import io
+import time
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update
 from telegram.ext import (
@@ -18,22 +19,31 @@ from telegram.ext import (
 )
 
 # ==================== إعدادات ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))
 DATA_FILE = "game_data.json"
-MAP_FILE = "map_base.png"   # صورة الخريطة الأساسية
-FLAGS_DIR = "flags"         # مجلد الأعلام  (flags/مصر.png مثلاً)
+MAP_FILE  = "map_base.png"
+FLAGS_DIR = "flags"
 os.makedirs(FLAGS_DIR, exist_ok=True)
 
-# ==================== إحداثيات الدول على الخريطة (2048x2048) ====================
+TAX_COOLDOWN = 15 * 60   # 15 دقيقة بالثواني
+FLAG_SIZE_MAIN = 200     # حجم العلم الرئيسي (كبير)
+FLAG_SIZE_SMALL = 100    # حجم العلم للأجزاء الثانوية
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# ==================== إحداثيات الدول (2048x2048) ====================
 REGION_COORDS = {
     "مصر":       [(378,  1077)],
-    "تركيا":     [(532,  407), (192, 306)],    # آسيا + أوروبا
+    "تركيا":     [(532,  407),  (192,  306)],
     "إيران":     [(1267, 642)],
     "الأردن":    [(662,  906)],
     "قطر":       [(1331, 1187)],
     "الإمارات":  [(1482, 1288)],
-    "عُمان":     [(1610, 1509), (1549, 1149)], # الجنوب + مضيق هرمز
+    "عُمان":     [(1610, 1509), (1549, 1149)],
     "فلسطين":    [(594,  844)],
     "الكويت":    [(1130, 948)],
     "العراق":    [(957,  749)],
@@ -47,29 +57,14 @@ REGION_COORDS = {
     "إسرائيل":  [(580,  870)],
 }
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-# ==================== الدول المتاحة ====================
-AVAILABLE_REGIONS = [
-    "مصر", "السعودية", "العراق", "سوريا", "تركيا",
-    "إيران", "الأردن", "لبنان", "اليمن", "الإمارات",
-    "قطر", "الكويت", "البحرين", "عُمان", "فلسطين",
-    "إسرائيل", "ليبيا", "السودان"
-]
+AVAILABLE_REGIONS = list(REGION_COORDS.keys())
 
 # ==================== تحميل وحفظ البيانات ====================
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {
-        "players": {},       # user_id -> بيانات اللاعب
-        "pending_codes": {}, # code -> user_id
-        "game_started": False
-    }
+    return {"players": {}, "pending_codes": {}, "unclaimed_lands": {}}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -85,51 +80,49 @@ def get_player(data, user_id):
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
-# ==================== توليد صورة الخريطة ====================
+def find_player_by_code(data, code):
+    """ابحث عن لاعب بكوده"""
+    for uid, p in data["players"].items():
+        if p.get("player_code") == code.upper():
+            return uid, p
+    return None, None
+
+# ==================== توليد الخريطة ====================
 def generate_map(players: dict) -> io.BytesIO:
-    """يرسم الخريطة مع أعلام الدول - يدعم الدول متعددة الأجزاء"""
     img = Image.open(MAP_FILE).convert("RGBA")
     draw = ImageDraw.Draw(img)
-
-    FLAG_SIZE = 120
 
     for uid, p in players.items():
         region = p.get("region")
         country_name = p.get("country_name", region)
         flag_path = os.path.join(FLAGS_DIR, f"{region}.png")
-
         if region not in REGION_COORDS:
             continue
 
-        coords_list = REGION_COORDS[region]  # دايماً list
-
-        for i, (cx, cy) in enumerate(coords_list):
+        for i, (cx, cy) in enumerate(REGION_COORDS[region]):
+            size = FLAG_SIZE_MAIN if i == 0 else FLAG_SIZE_SMALL
             if os.path.exists(flag_path):
                 flag = Image.open(flag_path).convert("RGBA")
-                # الجزء الأول: علم كامل - الأجزاء التانية: أصغر
-                size = FLAG_SIZE if i == 0 else FLAG_SIZE // 2
                 flag = flag.resize((size, int(size * 0.6)), Image.LANCZOS)
                 fw, fh = flag.size
-                fx = cx - fw // 2
-                fy = cy - fh // 2
+                fx, fy = cx - fw // 2, cy - fh // 2
                 img.paste(flag, (fx, fy), flag)
-                draw.rectangle([fx-2, fy-2, fx+fw+2, fy+fh+2], outline="white", width=3)
+                draw.rectangle([fx-3, fy-3, fx+fw+3, fy+fh+3], outline="white", width=4)
                 if i == 0:
-                    draw.text((cx, fy + fh + 5), country_name, fill="black", anchor="mt")
+                    draw.text((cx, fy + fh + 6), country_name, fill="black", anchor="mt")
             else:
-                r = 25 if i == 0 else 15
+                r = 30 if i == 0 else 15
                 draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill="#e74c3c", outline="white", width=3)
                 if i == 0:
-                    draw.text((cx, cy + r + 5), country_name, fill="black", anchor="mt")
+                    draw.text((cx, cy + r + 6), country_name, fill="black", anchor="mt")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf
 
-# ==================== معالج الرسائل العربية ====================
+# ==================== معالج الرسائل ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # نحدد النص - ممكن يجي من رسالة نصية أو caption لصورة
     if update.message.text:
         text = update.message.text.strip()
     elif update.message.caption:
@@ -137,11 +130,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = ""
 
-    user_id = update.effective_user.id
+    user_id   = update.effective_user.id
     user_name = update.effective_user.first_name
-    data = load_data()
+    data      = load_data()
 
-    # ======= أدمن: رفع علم مع أمر دولة =======
+    # ======= أدمن: إنشاء دولة مع علم (صورة + caption) =======
     if is_admin(user_id) and update.message.photo and text.startswith("دولة "):
         parts = text.split()
         if len(parts) < 4:
@@ -151,47 +144,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        code = parts[-1].upper()
-        region = parts[1]
+        code         = parts[-1].upper()
+        region       = parts[1]
         country_name = " ".join(parts[2:-1])
 
         if code not in data["pending_codes"]:
             await update.message.reply_text(f"❌ الكود `{code}` مش موجود.", parse_mode="Markdown")
             return
-
         if region not in AVAILABLE_REGIONS:
-            await update.message.reply_text(f"⚠️ المنطقة '{region}' مش في القائمة.")
+            await update.message.reply_text(f"⚠️ المنطقة '{region}' مش في القائمة.\nالمتاح: {', '.join(AVAILABLE_REGIONS)}")
             return
-
         for uid, p in data["players"].items():
             if p["region"] == region:
-                await update.message.reply_text(f"❌ المنطقة '{region}' محجوزة من {p['country_name']}.")
+                await update.message.reply_text(f"❌ '{region}' محجوزة من {p['country_name']}.")
                 return
 
-        # حفظ العلم
-        photo = update.message.photo[-1]
+        photo     = update.message.photo[-1]
         flag_file = await context.bot.get_file(photo.file_id)
         flag_path = os.path.join(FLAGS_DIR, f"{region}.png")
         await flag_file.download_to_drive(flag_path)
 
-        player_id = data["pending_codes"].pop(code)
+        player_id  = data["pending_codes"].pop(code)
+        player_code = generate_code()
         data["players"][str(player_id)] = {
             "country_name": country_name,
-            "region": region,
-            "gold": 1000,
-            "army": 100,
-            "factories": 1,
-            "farms": 1,
-            "territories": 1,
-            "allies": [],
-            "at_war": []
+            "region":       region,
+            "gold":         1000,
+            "army":         100,
+            "factories":    1,
+            "farms":        1,
+            "territories":  1,
+            "allies":       [],
+            "at_war":       [],
+            "last_tax":     0,
+            "player_code":  player_code,
         }
         save_data(data)
 
         await update.message.reply_text(
             f"✅ تم إنشاء الدولة مع العلم!\n\n"
             f"🏳️ *{country_name}* ← {region}\n"
-            f"💰 ذهب: 1,000 | ⚔️ جيش: 100",
+            f"🔑 كود اللاعب: `{player_code}`",
             parse_mode="Markdown"
         )
         try:
@@ -216,42 +209,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         player = get_player(data, user_id)
         if player:
             await update.message.reply_text(
-                f"⚠️ أنت بالفعل لديك دولة: *{player['country_name']}* ({player['region']})",
+                f"⚠️ عندك بالفعل دولة: *{player['country_name']}*",
                 parse_mode="Markdown"
             )
             return
-
-        # تحقق لو اللاعب عنده كود معلق
-        existing_code = None
-        for code, uid in data["pending_codes"].items():
-            if uid == user_id:
-                existing_code = code
-                break
-
+        existing_code = next((c for c, uid in data["pending_codes"].items() if uid == user_id), None)
         if existing_code:
             await update.message.reply_text(
-                f"⏳ طلبك قيد الانتظار!\n\n"
-                f"كودك هو: `{existing_code}`\n\n"
-                f"ابعته للأدمن عشان يفعّل دولتك.",
+                f"⏳ طلبك منتظر!\nكودك: `{existing_code}`\nابعته للأدمن.",
                 parse_mode="Markdown"
             )
             return
-
         code = generate_code()
         while code in data["pending_codes"]:
             code = generate_code()
-
         data["pending_codes"][code] = user_id
         save_data(data)
-
         await update.message.reply_text(
-            f"🎮 أهلاً {user_name}!\n\n"
-            f"كودك الشخصي هو:\n"
-            f"```\n{code}\n```\n\n"
-            f"📌 ابعت الكود ده للأدمن عشان يختارلك:\n"
-            f"• المنطقة الجغرافية (مثلاً: مصر، العراق...)\n"
-            f"• اسم دولتك اللي عايزه\n\n"
-            f"⏳ استنى تأكيد الأدمن...",
+            f"🎮 أهلاً {user_name}!\n\nكودك:\n```\n{code}\n```\n\nابعته للأدمن عشان يفعّل دولتك.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # كودي
+    if text in ["كودي", "كود اللاعب", "الكود"]:
+        player = get_player(data, user_id)
+        if not player:
+            await update.message.reply_text("❌ مش مسجل في اللعبة.")
+            return
+        await update.message.reply_text(
+            f"🔑 كودك الشخصي:\n```\n{player.get('player_code', 'غير متوفر')}\n```\n\nاستخدمه لاستقبال التحويلات.",
             parse_mode="Markdown"
         )
         return
@@ -260,23 +247,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ["حالة دولتي", "دولتي", "وضعي"]:
         player = get_player(data, user_id)
         if not player:
-            await update.message.reply_text(
-                "❌ مش مسجل في اللعبة.\n\nاكتب *انشاء دولة* للانضمام.",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text("❌ مش مسجل.\nاكتب *انشاء دولة*", parse_mode="Markdown")
             return
-
         p = player
+        cooldown_left = TAX_COOLDOWN - (time.time() - p.get("last_tax", 0))
+        tax_status = "✅ جاهزة" if cooldown_left <= 0 else f"⏳ {int(cooldown_left // 60)} دقيقة"
         msg = (
-            f"🏳️ دولة: *{p['country_name']}*\n"
-            f"🗺️ منطقة: {p['region']}\n\n"
+            f"🏳️ *{p['country_name']}* ({p['region']})\n\n"
             f"💰 الذهب: {p['gold']:,}\n"
             f"⚔️ الجيش: {p['army']:,}\n"
             f"🏭 المصانع: {p['factories']}\n"
             f"🌾 المزارع: {p['farms']}\n"
-            f"🗺️ الأراضي: {p['territories']} منطقة\n\n"
+            f"🗺️ الأراضي: {p['territories']}\n\n"
+            f"💵 جمع الضرائب: {tax_status}\n\n"
             f"🤝 التحالفات: {', '.join(p['allies']) if p['allies'] else 'لا يوجد'}\n"
-            f"⚠️ الحروب: {', '.join(p['at_war']) if p['at_war'] else 'في سلام'}"
+            f"⚔️ الحروب: {', '.join(p['at_war']) if p['at_war'] else 'في سلام'}"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
@@ -284,13 +269,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # قائمة الدول
     if text in ["قائمة الدول", "الدول", "اللاعبين"]:
         if not data["players"]:
-            await update.message.reply_text("🗺️ لا يوجد دول مسجلة بعد.")
+            await update.message.reply_text("🗺️ لا يوجد دول بعد.")
             return
-
         msg = "🗺️ *الدول في اللعبة:*\n\n"
         for uid, p in data["players"].items():
-            msg += f"• *{p['country_name']}* ({p['region']}) - ذهب: {p['gold']:,} | جيش: {p['army']:,}\n"
+            msg += f"• *{p['country_name']}* ({p['region']}) — ذهب: {p['gold']:,} | جيش: {p['army']:,} | أراضي: {p['territories']}\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # جمع الضرائب (كول داون 15 دقيقة)
+    if text in ["جمع الضرائب", "اجمع الضرائب", "جمع موارد"]:
+        player = get_player(data, user_id)
+        if not player:
+            await update.message.reply_text("❌ مش مسجل في اللعبة.")
+            return
+        now = time.time()
+        last_tax = player.get("last_tax", 0)
+        cooldown_left = TAX_COOLDOWN - (now - last_tax)
+        if cooldown_left > 0:
+            mins = int(cooldown_left // 60)
+            secs = int(cooldown_left % 60)
+            await update.message.reply_text(
+                f"⏳ لازم تستنى *{mins}:{secs:02d}* دقيقة قبل ما تجمع تاني!",
+                parse_mode="Markdown"
+            )
+            return
+        income = (player["factories"] * 150) + (player["farms"] * 80) + (player["territories"] * 50) + 200
+        data["players"][str(user_id)]["gold"]    += income
+        data["players"][str(user_id)]["last_tax"] = now
+        save_data(data)
+        await update.message.reply_text(
+            f"💰 *تم جمع الموارد!*\n\n"
+            f"🏭 مصانع ({player['factories']}): +{player['factories']*150:,}\n"
+            f"🌾 مزارع ({player['farms']}): +{player['farms']*80:,}\n"
+            f"🗺️ أراضي ({player['territories']}): +{player['territories']*50:,}\n"
+            f"👑 دخل أساسي: +200\n\n"
+            f"✅ الإجمالي: +{income:,} ذهب\n"
+            f"💰 رصيدك الكلي: {player['gold']+income:,}\n\n"
+            f"⏳ القادم بعد 15 دقيقة",
+            parse_mode="Markdown"
+        )
         return
 
     # بناء مصنع
@@ -301,15 +319,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cost = 500
         if player["gold"] < cost:
-            await update.message.reply_text(f"❌ محتاج {cost} ذهب لبناء مصنع. عندك {player['gold']} فقط.")
+            await update.message.reply_text(f"❌ محتاج {cost} ذهب. عندك {player['gold']:,} فقط.")
             return
-        data["players"][str(user_id)]["gold"] -= cost
+        data["players"][str(user_id)]["gold"]     -= cost
         data["players"][str(user_id)]["factories"] += 1
         save_data(data)
         await update.message.reply_text(
-            f"🏭 تم بناء مصنع جديد!\n"
-            f"المصانع الكلية: {player['factories'] + 1}\n"
-            f"الذهب المتبقي: {player['gold'] - cost:,}"
+            f"🏭 تم بناء مصنع!\nالمصانع: {player['factories']+1} | الذهب: {player['gold']-cost:,}"
         )
         return
 
@@ -321,19 +337,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cost = 300
         if player["gold"] < cost:
-            await update.message.reply_text(f"❌ محتاج {cost} ذهب لبناء مزرعة. عندك {player['gold']} فقط.")
+            await update.message.reply_text(f"❌ محتاج {cost} ذهب. عندك {player['gold']:,} فقط.")
             return
-        data["players"][str(user_id)]["gold"] -= cost
+        data["players"][str(user_id)]["gold"]  -= cost
         data["players"][str(user_id)]["farms"] += 1
         save_data(data)
         await update.message.reply_text(
-            f"🌾 تم بناء مزرعة جديدة!\n"
-            f"المزارع الكلية: {player['farms'] + 1}\n"
-            f"الذهب المتبقي: {player['gold'] - cost:,}"
+            f"🌾 تم بناء مزرعة!\nالمزارع: {player['farms']+1} | الذهب: {player['gold']-cost:,}"
         )
         return
 
-    # تجنيد جيش
+    # تجنيد
     if text.startswith("تجنيد "):
         player = get_player(data, user_id)
         if not player:
@@ -341,20 +355,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             amount = int(text.replace("تجنيد", "").strip())
+            if amount <= 0:
+                raise ValueError
             cost = amount * 10
             if player["gold"] < cost:
-                await update.message.reply_text(f"❌ تجنيد {amount:,} جندي يكلف {cost:,} ذهب. عندك {player['gold']:,} فقط.")
+                await update.message.reply_text(f"❌ تجنيد {amount:,} يكلف {cost:,} ذهب. عندك {player['gold']:,} فقط.")
                 return
             data["players"][str(user_id)]["gold"] -= cost
             data["players"][str(user_id)]["army"] += amount
             save_data(data)
             await update.message.reply_text(
-                f"⚔️ تم تجنيد {amount:,} جندي!\n"
-                f"حجم الجيش الكلي: {player['army'] + amount:,}\n"
-                f"الذهب المتبقي: {player['gold'] - cost:,}"
+                f"⚔️ تم تجنيد {amount:,} جندي!\nالجيش: {player['army']+amount:,} | الذهب: {player['gold']-cost:,}"
             )
         except ValueError:
-            await update.message.reply_text("❌ اكتب العدد صح. مثال: تجنيد 100")
+            await update.message.reply_text("❌ مثال: تجنيد 100")
         return
 
     # هجوم
@@ -365,132 +379,223 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         target_name = text.replace("هجوم على", "").strip()
-        target_player = None
-        target_uid = None
+        target_player, target_uid = None, None
 
+        # هجوم على أرض بدون صاحب
+        unclaimed = data.get("unclaimed_lands", {})
+        if target_name in unclaimed:
+            land = unclaimed[target_name]
+            defend_power = land.get("defense", 50) * random.uniform(0.7, 1.3)
+            attack_power = player["army"] * random.uniform(0.7, 1.3)
+            if attack_power > defend_power:
+                data["players"][str(user_id)]["territories"] += 1
+                del data["unclaimed_lands"][target_name]
+                losses = random.randint(5, 30)
+                data["players"][str(user_id)]["army"] = max(0, player["army"] - losses)
+                save_data(data)
+                await update.message.reply_text(
+                    f"⚔️ *انتصار على أرض '{target_name}'!*\n\n"
+                    f"🗺️ ضممت أرض جديدة!\n💀 خسائر: {losses} جندي",
+                    parse_mode="Markdown"
+                )
+            else:
+                losses = random.randint(20, 80)
+                data["players"][str(user_id)]["army"] = max(0, player["army"] - losses)
+                save_data(data)
+                await update.message.reply_text(
+                    f"❌ *هزيمة أمام دفاعات '{target_name}'!*\n\n💀 خسائر: {losses} جندي",
+                    parse_mode="Markdown"
+                )
+            return
+
+        # هجوم على لاعب
         for uid, p in data["players"].items():
             if p["country_name"] == target_name or p["region"] == target_name:
-                target_player = p
-                target_uid = uid
+                target_player, target_uid = p, uid
                 break
 
         if not target_player:
-            await update.message.reply_text(f"❌ مش لاقي دولة اسمها '{target_name}'.")
-            return
-
-        if target_uid == str(user_id):
-            await update.message.reply_text("❌ مينفعش تهاجم نفسك! 😅")
-            return
-
-        if target_name in player.get("allies", []):
-            await update.message.reply_text(f"❌ {target_name} حليفك! مينفعش تهاجمه.")
-            return
-
-        # حساب نتيجة الحرب
-        attacker_power = player["army"] * random.uniform(0.7, 1.3)
-        defender_power = target_player["army"] * random.uniform(0.7, 1.3)
-
-        if attacker_power > defender_power:
-            # المهاجم يكسب
-            loot = min(target_player["gold"] // 3, 500)
-            data["players"][str(user_id)]["gold"] += loot
-            data["players"][str(user_id)]["territories"] += 1
-            data["players"][target_uid]["gold"] -= loot
-            data["players"][target_uid]["territories"] = max(1, target_player["territories"] - 1)
-            losses_att = random.randint(10, 50)
-            losses_def = random.randint(50, 150)
-            data["players"][str(user_id)]["army"] = max(0, player["army"] - losses_att)
-            data["players"][target_uid]["army"] = max(0, target_player["army"] - losses_def)
-            save_data(data)
             await update.message.reply_text(
-                f"⚔️ *نتيجة المعركة - انتصار!*\n\n"
-                f"🏆 {player['country_name']} هزم {target_player['country_name']}\n"
-                f"💰 غنيمة: {loot:,} ذهب\n"
-                f"🗺️ ضممت منطقة جديدة!\n"
-                f"💀 خسائرك: {losses_att} جندي\n"
-                f"💀 خسائر العدو: {losses_def} جندي",
+                f"❌ مش لاقي '{target_name}'.\nاكتب *قائمة الدول* للأراضي المتاحة.",
                 parse_mode="Markdown"
             )
-        else:
-            # المدافع يكسب
-            losses_att = random.randint(50, 200)
-            losses_def = random.randint(10, 50)
-            data["players"][str(user_id)]["army"] = max(0, player["army"] - losses_att)
-            data["players"][target_uid]["army"] = max(0, target_player["army"] - losses_def)
+            return
+        if target_uid == str(user_id):
+            await update.message.reply_text("❌ مينفعش تهاجم نفسك!")
+            return
+        if target_player["country_name"] in player.get("allies", []):
+            await update.message.reply_text(f"❌ {target_player['country_name']} حليفك!")
+            return
+
+        att = player["army"] * random.uniform(0.7, 1.3)
+        deff = target_player["army"] * random.uniform(0.7, 1.3)
+
+        if att > deff:
+            loot = min(target_player["gold"] // 3, 500)
+            losses_att = random.randint(10, 50)
+            losses_def = random.randint(50, 150)
+            data["players"][str(user_id)]["gold"]        += loot
+            data["players"][str(user_id)]["territories"] += 1
+            data["players"][str(user_id)]["army"]         = max(0, player["army"] - losses_att)
+            data["players"][target_uid]["gold"]           -= loot
+            data["players"][target_uid]["territories"]    = max(1, target_player["territories"] - 1)
+            data["players"][target_uid]["army"]           = max(0, target_player["army"] - losses_def)
             save_data(data)
             await update.message.reply_text(
-                f"⚔️ *نتيجة المعركة - هزيمة!*\n\n"
+                f"⚔️ *انتصار!*\n\n"
+                f"🏆 {player['country_name']} هزم {target_player['country_name']}\n"
+                f"💰 غنيمة: {loot:,} ذهب\n🗺️ أرض جديدة!\n"
+                f"💀 خسائرك: {losses_att} | خسائر العدو: {losses_def}",
+                parse_mode="Markdown"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(target_uid),
+                    text=f"⚠️ *{player['country_name']} هاجمك وانتصر!*\nخسرت {loot:,} ذهب وأرض.\nخسائر جيشك: {losses_def}",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        else:
+            losses_att = random.randint(50, 200)
+            losses_def = random.randint(10, 50)
+            data["players"][str(user_id)]["army"]  = max(0, player["army"] - losses_att)
+            data["players"][target_uid]["army"]    = max(0, target_player["army"] - losses_def)
+            save_data(data)
+            await update.message.reply_text(
+                f"⚔️ *هزيمة!*\n\n"
                 f"❌ {player['country_name']} انهزم أمام {target_player['country_name']}\n"
-                f"💀 خسائرك: {losses_att} جندي\n"
-                f"💀 خسائر العدو: {losses_def} جندي",
+                f"💀 خسائرك: {losses_att} | خسائر العدو: {losses_def}",
                 parse_mode="Markdown"
             )
         return
 
-    # طلب تحالف
+    # تحالف مع
     if text.startswith("تحالف مع "):
         player = get_player(data, user_id)
         if not player:
             await update.message.reply_text("❌ مش مسجل في اللعبة.")
             return
-
         target_name = text.replace("تحالف مع", "").strip()
-        found = False
         for uid, p in data["players"].items():
             if p["country_name"] == target_name or p["region"] == target_name:
-                found = True
                 if target_name in player.get("allies", []):
                     await update.message.reply_text(f"✅ أنت بالفعل حليف مع {target_name}.")
                     return
-                data["players"][str(user_id)]["allies"].append(target_name)
+                data["players"][str(user_id)]["allies"].append(p["country_name"])
                 data["players"][uid]["allies"].append(player["country_name"])
                 save_data(data)
-                await update.message.reply_text(
-                    f"🤝 تم إعلان التحالف مع *{target_name}*!",
-                    parse_mode="Markdown"
-                )
+                await update.message.reply_text(f"🤝 تم التحالف مع *{p['country_name']}*!", parse_mode="Markdown")
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(uid),
+                        text=f"🤝 *{player['country_name']}* أعلن التحالف معك!",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
                 return
-
-        if not found:
-            await update.message.reply_text(f"❌ مش لاقي دولة اسمها '{target_name}'.")
+        await update.message.reply_text(f"❌ مش لاقي '{target_name}'.")
         return
 
-    # جمع الضرائب
-    if text in ["جمع الضرائب", "اجمع الضرائب", "جمع موارد"]:
+    # إهداء أراضي: اهدي أرض [كود اللاعب]
+    if text.startswith("اهدي أرض ") or text.startswith("اهدي ارض "):
         player = get_player(data, user_id)
         if not player:
             await update.message.reply_text("❌ مش مسجل في اللعبة.")
             return
-
-        income = (player["factories"] * 150) + (player["farms"] * 80) + (player["territories"] * 50) + 200
-        data["players"][str(user_id)]["gold"] += income
+        if player["territories"] <= 1:
+            await update.message.reply_text("❌ ما عندكش أراضي كافية للإهداء (الحد الأدنى 1).")
+            return
+        target_code = text.split()[-1].upper()
+        target_uid, target_player = find_player_by_code(data, target_code)
+        if not target_player:
+            await update.message.reply_text(f"❌ مش لاقي لاعب بالكود `{target_code}`.", parse_mode="Markdown")
+            return
+        if target_uid == str(user_id):
+            await update.message.reply_text("❌ مينفعش تهدي نفسك!")
+            return
+        data["players"][str(user_id)]["territories"] -= 1
+        data["players"][target_uid]["territories"]   += 1
         save_data(data)
         await update.message.reply_text(
-            f"💰 *تم جمع الموارد!*\n\n"
-            f"🏭 من المصانع ({player['factories']}): {player['factories'] * 150:,}\n"
-            f"🌾 من المزارع ({player['farms']}): {player['farms'] * 80:,}\n"
-            f"🗺️ من الأراضي ({player['territories']}): {player['territories'] * 50:,}\n"
-            f"👑 دخل أساسي: 200\n\n"
-            f"✅ إجمالي: +{income:,} ذهب\n"
-            f"💰 الرصيد الكلي: {player['gold'] + income:,}",
+            f"🎁 أهديت أرض لـ *{target_player['country_name']}*!\n"
+            f"أراضيك الآن: {player['territories']-1}",
             parse_mode="Markdown"
         )
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_uid),
+                text=f"🎁 *{player['country_name']}* أهداك أرض!\nأراضيك الآن: {target_player['territories']+1}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        return
+
+    # تحويل ذهب: تحويل [مبلغ] [كود اللاعب]
+    if text.startswith("تحويل "):
+        player = get_player(data, user_id)
+        if not player:
+            await update.message.reply_text("❌ مش مسجل في اللعبة.")
+            return
+        parts = text.split()
+        if len(parts) != 3:
+            await update.message.reply_text(
+                "❌ الصيغة الصحيحة:\n`تحويل [المبلغ] [كود اللاعب]`\n\nمثال: `تحويل 500 ABC123`",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            amount = int(parts[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ المبلغ لازم يكون رقم أكبر من صفر.")
+            return
+        if player["gold"] < amount:
+            await update.message.reply_text(f"❌ ما عندكش كفاية. عندك {player['gold']:,} ذهب بس.")
+            return
+        target_code = parts[2].upper()
+        target_uid, target_player = find_player_by_code(data, target_code)
+        if not target_player:
+            await update.message.reply_text(f"❌ مش لاقي لاعب بالكود `{target_code}`.", parse_mode="Markdown")
+            return
+        if target_uid == str(user_id):
+            await update.message.reply_text("❌ مينفعش تحول لنفسك!")
+            return
+        data["players"][str(user_id)]["gold"] -= amount
+        data["players"][target_uid]["gold"]   += amount
+        save_data(data)
+        await update.message.reply_text(
+            f"💸 تم تحويل *{amount:,}* ذهب لـ *{target_player['country_name']}*!\n"
+            f"رصيدك: {player['gold']-amount:,}",
+            parse_mode="Markdown"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_uid),
+                text=f"💰 استلمت *{amount:,}* ذهب من *{player['country_name']}*!\nرصيدك: {target_player['gold']+amount:,}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
         return
 
     # خريطة
     if text in ["خريطة", "الخريطة", "map"]:
         if not data["players"]:
-            await update.message.reply_text("🗺️ لا يوجد دول مسجلة بعد في الخريطة.")
+            await update.message.reply_text("🗺️ لا يوجد دول بعد.")
             return
         await update.message.reply_text("🗺️ جاري توليد الخريطة...")
         try:
             map_buf = generate_map(data["players"])
-            caption = "🗺️ *خريطة الشرق الأوسط الحالية*\n\n"
+            caption = "🗺️ *خريطة الشرق الأوسط*\n\n"
             for uid, p in data["players"].items():
                 caption += f"🏳️ *{p['country_name']}* ← {p['region']}\n"
             await update.message.reply_photo(photo=map_buf, caption=caption, parse_mode="Markdown")
         except Exception as e:
-            await update.message.reply_text(f"❌ حصل خطأ في توليد الخريطة: {e}")
+            await update.message.reply_text(f"❌ خطأ: {e}")
         return
 
     # مساعدة
@@ -498,19 +603,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📖 *أوامر اللعبة:*\n\n"
             "🔹 *انضمام:*\n"
-            "• `انشاء دولة` - طلب الانضمام للعبة\n\n"
+            "• `انشاء دولة` — طلب الانضمام\n"
+            "• `كودي` — اعرف كودك الشخصي\n\n"
             "🔹 *معلومات:*\n"
-            "• `حالة دولتي` - اعرف وضع دولتك\n"
-            "• `قائمة الدول` - اشوف كل الدول\n\n"
+            "• `حالة دولتي` — وضع دولتك\n"
+            "• `قائمة الدول` — كل الدول\n"
+            "• `خريطة` — الخريطة الحالية\n\n"
             "🔹 *اقتصاد:*\n"
-            "• `جمع الضرائب` - اجمع دخلك\n"
-            "• `بناء مصنع` - ابني مصنع (500 ذهب)\n"
-            "• `بناء مزرعة` - ابني مزرعة (300 ذهب)\n\n"
+            "• `جمع الضرائب` — كل 15 دقيقة\n"
+            "• `بناء مصنع` — 500 ذهب\n"
+            "• `بناء مزرعة` — 300 ذهب\n"
+            "• `تحويل 500 [كود]` — حول ذهب\n\n"
             "🔹 *جيش:*\n"
-            "• `تجنيد 100` - جند جنود (10 ذهب/جندي)\n"
-            "• `هجوم على [اسم الدولة]` - اهاجم دولة\n\n"
+            "• `تجنيد 100` — 10 ذهب/جندي\n"
+            "• `هجوم على [اسم]` — هاجم دولة أو أرض\n\n"
             "🔹 *دبلوماسية:*\n"
-            "• `تحالف مع [اسم الدولة]` - اعقد تحالف\n",
+            "• `تحالف مع [اسم]` — اعقد تحالف\n"
+            "• `اهدي أرض [كود]` — أهدي أرض للاعب\n",
             parse_mode="Markdown"
         )
         return
@@ -518,78 +627,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ======= أوامر الأدمن =======
     if is_admin(user_id):
 
-        # دولة [منطقة] [اسم الدولة] [كود]
+        # دولة (بدون علم - نصي فقط)
         if text.startswith("دولة "):
             parts = text.split()
-            # مثال: دولة مصر كردستان ABC123
             if len(parts) < 4:
                 await update.message.reply_text(
-                    "❌ الصيغة الصحيحة:\n`دولة [المنطقة] [اسم الدولة] [الكود]`\n\n"
-                    "مثال: `دولة مصر كردستان ABC123`",
+                    "❌ الصيغة:\n`دولة [المنطقة] [اسم الدولة] [الكود]`\nوارفق صورة العلم",
                     parse_mode="Markdown"
                 )
                 return
-
-            code = parts[-1].upper()
-            region = parts[1]
+            code         = parts[-1].upper()
+            region       = parts[1]
             country_name = " ".join(parts[2:-1])
-
             if code not in data["pending_codes"]:
-                await update.message.reply_text(f"❌ الكود `{code}` مش موجود أو استُخدم من قبل.", parse_mode="Markdown")
+                await update.message.reply_text(f"❌ الكود `{code}` مش موجود.", parse_mode="Markdown")
                 return
-
             if region not in AVAILABLE_REGIONS:
-                await update.message.reply_text(
-                    f"⚠️ المنطقة '{region}' مش في القائمة.\n\n"
-                    f"المناطق المتاحة:\n{', '.join(AVAILABLE_REGIONS)}"
-                )
+                await update.message.reply_text(f"⚠️ المنطقة '{region}' مش في القائمة.")
                 return
-
-            # تحقق إن المنطقة مش محجوزة
             for uid, p in data["players"].items():
                 if p["region"] == region:
-                    await update.message.reply_text(f"❌ المنطقة '{region}' محجوزة بالفعل من {p['country_name']}.")
+                    await update.message.reply_text(f"❌ '{region}' محجوزة من {p['country_name']}.")
                     return
-
-            player_id = data["pending_codes"].pop(code)
+            player_id   = data["pending_codes"].pop(code)
+            player_code = generate_code()
             data["players"][str(player_id)] = {
                 "country_name": country_name,
-                "region": region,
-                "gold": 1000,
-                "army": 100,
-                "factories": 1,
-                "farms": 1,
-                "territories": 1,
-                "allies": [],
-                "at_war": []
+                "region":       region,
+                "gold":         1000,
+                "army":         100,
+                "factories":    1,
+                "farms":        1,
+                "territories":  1,
+                "allies":       [],
+                "at_war":       [],
+                "last_tax":     0,
+                "player_code":  player_code,
             }
             save_data(data)
-
             await update.message.reply_text(
-                f"✅ تم إنشاء الدولة!\n\n"
-                f"🏳️ الاسم: *{country_name}*\n"
-                f"🗺️ المنطقة: {region}\n"
-                f"💰 ذهب ابتدائي: 1,000\n"
-                f"⚔️ جيش ابتدائي: 100",
+                f"✅ تم إنشاء الدولة!\n🏳️ *{country_name}* ← {region}\n🔑 كود اللاعب: `{player_code}`",
                 parse_mode="Markdown"
             )
-
-            # إبلاغ اللاعب
             try:
                 await context.bot.send_message(
                     chat_id=player_id,
-                    text=(
-                        f"🎉 تم تفعيل دولتك!\n\n"
-                        f"🏳️ اسم الدولة: *{country_name}*\n"
-                        f"🗺️ المنطقة: {region}\n\n"
-                        f"💰 ذهب: 1,000\n"
-                        f"⚔️ جيش: 100\n\n"
-                        f"اكتب *مساعدة* لشوف الأوامر!"
-                    ),
+                    text=f"🎉 دولتك اتفعّلت!\n🏳️ *{country_name}* ← {region}\n\nاكتب *مساعدة* لشوف الأوامر!",
                     parse_mode="Markdown"
                 )
             except Exception:
                 pass
+            return
+
+        # إضافة أرض بدون صاحب
+        if text.startswith("أضف أرض "):
+            parts = text.split(maxsplit=3)
+            # أضف أرض [اسم الأرض] [قوة الدفاع]
+            if len(parts) < 4:
+                await update.message.reply_text("❌ الصيغة: `أضف أرض [الاسم] [قوة الدفاع]`\nمثال: `أضف أرض الصحراء 80`", parse_mode="Markdown")
+                return
+            try:
+                land_name   = parts[2]
+                defense_val = int(parts[3])
+            except (ValueError, IndexError):
+                await update.message.reply_text("❌ قوة الدفاع لازم تكون رقم.")
+                return
+            if "unclaimed_lands" not in data:
+                data["unclaimed_lands"] = {}
+            data["unclaimed_lands"][land_name] = {"defense": defense_val}
+            save_data(data)
+            await update.message.reply_text(f"✅ تمت إضافة أرض '{land_name}' بقوة دفاع {defense_val}.")
             return
 
         # حذف دولة
@@ -599,9 +706,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if p["country_name"] == country_name:
                     del data["players"][uid]
                     save_data(data)
-                    await update.message.reply_text(f"✅ تم حذف دولة {country_name}.")
+                    await update.message.reply_text(f"✅ تم حذف {country_name}.")
                     return
-            await update.message.reply_text(f"❌ مش لاقي دولة اسمها '{country_name}'.")
+            await update.message.reply_text(f"❌ مش لاقي '{country_name}'.")
             return
 
         # الطلبات المعلقة
@@ -609,28 +716,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not data["pending_codes"]:
                 await update.message.reply_text("✅ مفيش طلبات معلقة.")
                 return
-            msg = "📋 *الطلبات المعلقة:*\n\n"
+            msg = "📋 *الطلبات:*\n\n"
             for code, uid in data["pending_codes"].items():
-                msg += f"• كود: `{code}` - User ID: `{uid}`\n"
+                msg += f"• كود: `{code}` — ID: `{uid}`\n"
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
 
-# ==================== الأمر /start ====================
+# ==================== /start ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🌍 *أهلاً بك في لعبة الشرق الأوسط الجيوسياسية!*\n\n"
-        "ابن دولتك، طور اقتصادك، جند جيشك، واتحالف أو احارب!\n\n"
-        "للبدء اكتب: *انشاء دولة*\n"
-        "للمساعدة اكتب: *مساعدة*",
+        "🌍 *أهلاً بك في لعبة الشرق الأوسط!*\n\n"
+        "ابن دولتك، طور اقتصادك، جند جيشك!\n\n"
+        "للبدء: *انشاء دولة*\n"
+        "للمساعدة: *مساعدة*",
         parse_mode="Markdown"
     )
 
-# ==================== تشغيل البوت ====================
+# ==================== تشغيل ====================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_message))  # لاستقبال الأعلام
+    app.add_handler(MessageHandler(filters.PHOTO, handle_message))
     print("✅ البوت شغال!")
     app.run_polling()
 
