@@ -1,252 +1,132 @@
 """
-🗺️ لعبة الشرق الأوسط الجيوسياسية - النسخة المتقدمة
+🗺️ لعبة الشرق الأوسط الجيوسياسية - النسخة 3.0
 """
-
 import logging, random, string, json, os, io, time, asyncio
 from PIL import Image, ImageDraw
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
-BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID        = int(os.environ.get("ADMIN_ID", "0"))
-DATA_FILE       = "game_data.json"
-MAP_FILE        = "map_base.png"
-FLAGS_DIR       = "flags"
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
+DATA_FILE  = "game_data.json"
+MAP_FILE   = "map_base.png"
+FLAGS_DIR  = "flags"
 os.makedirs(FLAGS_DIR, exist_ok=True)
 
-# ==================== نظام الوقت ====================
-GAME_MINUTE     = 3          # 1 دقيقة لعبة = 3 ثواني حقيقية... لا
-# 1 ساعة لعبة = 3 دقائق حقيقية = 180 ثانية
-HOUR_REAL       = 180        # ثانية حقيقية = ساعة لعبة
-DAY_REAL        = HOUR_REAL * 24
-WEEK_REAL       = DAY_REAL * 7   # 21 دقيقة = 1260 ثانية
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-TAX_COOLDOWN    = HOUR_REAL * 5  # كل 5 ساعات لعبة = 15 دقيقة حقيقية
-DISASTER_EVERY  = WEEK_REAL      # كارثة كل أسبوع لعبة = 21 دقيقة حقيقية
-SHIP_MIN        = HOUR_REAL * 2  # أقل وقت شحن = 2 ساعة لعبة = 6 دقائق
-SHIP_MAX        = HOUR_REAL * 6  # أقصى وقت شحن = 6 ساعات لعبة = 18 دقيقة
+# ==================== توقيتات ====================
+HOUR_REAL      = 180        # ثانية = ساعة لعبة
+WEEK_REAL      = HOUR_REAL * 24 * 7
+TAX_COOLDOWN   = HOUR_REAL * 5   # 15 دقيقة
+DISASTER_EVERY = WEEK_REAL       # 21 دقيقة
+ATTACK_CD      = 60 * 5          # cooldown هجوم 5 دقائق
+ALLY_REQ_TTL   = 60 * 30         # طلبات تحالف تنتهي بعد 30 دقيقة
+MAX_MARKET_PER_PLAYER = 5        # حد أقصى عروض في السوق
 
 FLAG_SIZE_MAIN  = 200
 FLAG_SIZE_SMALL = 100
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-# ==================== نظام السكان والأحوال ====================
-def calc_population(player):
-    """السكان بالمليون — حسب المزارع + الغذاء + الأراضي + الاقتصاد"""
-    base       = 1.0  # مليون
-    terr_bonus = player.get("territories", 1) * 0.3
-    # الغذاء: كل حقل زراعي يزيد السكان
-    crops_count = sum(player.get("crops", {}).values())
-    food_bonus  = crops_count * 0.5
-    # الاقتصاد: كل 1000 ذهب = 0.1 مليون
-    econ_bonus  = min(player.get("gold", 0) / 10000, 2.0)
-    # الحروب والكوارث تنقص السكان
-    wars_lost   = player.get("wars_lost", 0) * 0.2
-    disasters   = player.get("disasters_hit", 0) * 0.1
-    pop = max(0.5, base + terr_bonus + food_bonus + econ_bonus - wars_lost - disasters)
-    return round(pop, 1)
-
-def calc_food_security(player):
-    """مستوى الأمن الغذائي 0-100"""
-    crops_count = sum(player.get("crops", {}).values())
-    pop         = calc_population(player)
-    # كل حقل يكفي 0.5 مليون شخص
-    if pop == 0: return 100
-    ratio = (crops_count * 0.5) / pop
-    return min(100, int(ratio * 100))
-
-def calc_health(player):
-    """الصحة العامة 0-100"""
-    base     = 60
-    gold_b   = min(20, player.get("gold", 0) // 500)
-    food_b   = calc_food_security(player) // 5
-    wars_p   = player.get("wars_lost", 0) * 5
-    disas_p  = player.get("disasters_hit", 0) * 3
-    return max(10, min(100, base + gold_b + food_b - wars_p - disas_p))
-
-def calc_happiness(player):
-    """الرضا الاجتماعي 0-100"""
-    base   = 50
-    food_b = calc_food_security(player) // 4
-    econ_b = min(20, player.get("gold", 0) // 1000)
-    wars_p = player.get("wars_lost", 0) * 8
-    allies = len(player.get("allies", [])) * 3
-    traitor= -20 if player.get("traitor") else 0
-    return max(5, min(100, base + food_b + econ_b + allies - wars_p + traitor))
-
-def status_emoji(val):
-    if val >= 80: return "🟢"
-    if val >= 50: return "🟡"
-    if val >= 25: return "🟠"
-    return "🔴"
-
-def bar(val, length=10):
-    filled = int((val / 100) * length)
-    return "█" * filled + "░" * (length - filled)
-
-# ==================== تنسيق الرسائل ====================
-def sep(char="─", n=28):
-    return char * n
-
-def box_title(emoji, title):
-    return f"{emoji} *{title}*\n{sep()}"
-
-def fmt_num(n):
-    return f"{n:,}"
-
-def progress_bar(val, max_val, length=10):
-    filled = int((val / max_val) * length) if max_val > 0 else 0
-    return "█" * filled + "░" * (length - filled)
-
-
-
-# ==================== إحداثيات الدول ====================
+# ==================== قروض البنك الدولي ====================
+LOAN_OPTIONS = [
+    {"id":"small",  "name":"قرض صغير",  "amount":1000, "interest":0.20, "due_cycles":3,  "emoji":"💵"},
+    {"id":"medium", "name":"قرض متوسط", "amount":3000, "interest":0.25, "due_cycles":5,  "emoji":"💴"},
+    {"id":"large",  "name":"قرض كبير",  "amount":7000, "interest":0.30, "due_cycles":8,  "emoji":"💶"},
+]
+# due_cycles = عدد دورات الحصاد قبل السداد
+# ==================== إحداثيات ====================
 REGION_COORDS = {
-    "مصر":       [(378,  1077)],
-    "تركيا":     [(532,  407),  (192,  306)],
-    "إيران":     [(1267, 642)],
-    "الأردن":    [(662,  906)],
-    "قطر":       [(1331, 1187)],
-    "الإمارات":  [(1482, 1288)],
-    "عُمان":     [(1610, 1509), (1549, 1149)],
-    "فلسطين":    [(594,  844)],
-    "الكويت":    [(1130, 948)],
-    "العراق":    [(957,  749)],
-    "السعودية":  [(1080, 1246)],
-    "اليمن":     [(1206, 1703)],
-    "لبنان":     [(614,  692)],
-    "سوريا":     [(726,  618)],
-    "البحرين":   [(1010, 1080)],
-    "ليبيا":     [(150,  700)],
-    "السودان":   [(350,  1300)],
-    "إسرائيل":  [(580,  870)],
+    "مصر":      [(378,1077)],
+    "تركيا":    [(532,407),(192,306)],
+    "ايران":    [(1267,642)],
+    "الاردن":   [(662,906)],
+    "قطر":      [(1331,1187)],
+    "الامارات": [(1482,1288)],
+    "عمان":     [(1610,1509),(1549,1149)],
+    "فلسطين":   [(594,844)],
+    "الكويت":   [(1130,948)],
+    "العراق":   [(957,749)],
+    "السعودية": [(1080,1246)],
+    "اليمن":    [(1206,1703)],
+    "لبنان":    [(614,692)],
+    "سوريا":    [(726,618)],
+    "البحرين":  [(1010,1080)],
+    "ليبيا":    [(150,700)],
+    "السودان":  [(350,1300)],
+    "اسرائيل":  [(580,870)],
+    "مصر_شمال": [(378,900)],  # موقع السويس
 }
-AVAILABLE_REGIONS = list(REGION_COORDS.keys())
+AVAILABLE_REGIONS = [r for r in REGION_COORDS if r != "مصر_شمال"]
 
 # ==================== المضائق ====================
 STRAITS = {
-    "هرمز": {
-        "emoji": "⚓",
-        "controller": ["عُمان", "إيران"],   # الدول اللي تتحكم فيه
-        "affects": ["السعودية", "الكويت", "العراق", "قطر", "الإمارات", "البحرين"],  # الدول المتأثرة
-        "blocked": False,
-        "blocked_by": None,
-    },
-    "باب المندب": {
-        "emoji": "🚢",
-        "controller": ["اليمن"],
-        "affects": ["مصر", "السودان", "الأردن"],
-        "blocked": False,
-        "blocked_by": None,
-    },
+    "هرمز":       {"controller":["عمان","ايران"],  "affects":["السعودية","الكويت","العراق","قطر","الامارات","البحرين"], "blocked":False,"blocked_by":None},
+    "باب المندب": {"controller":["اليمن"],          "affects":["مصر","السودان","الاردن"],                               "blocked":False,"blocked_by":None},
+    "السويس":     {"controller":["مصر"],            "affects":["اردن","اسرائيل","لبنان","سوريا","تركيا","ليبيا","السودان"],"blocked":False,"blocked_by":None},
 }
 
 # ==================== الموارد ====================
-# الموارد الأساسية لكل منطقة
 REGION_RESOURCES = {
-    "السعودية":  ["نفط", "غاز"],
-    "الكويت":    ["نفط", "غاز"],
-    "العراق":    ["نفط", "غاز"],
-    "قطر":       ["غاز", "نفط"],
-    "ليبيا":     ["نفط"],
-    "إيران":     ["نفط", "غاز", "صلب"],
-    "الإمارات":  ["ذهب", "غاز"],
-    "البحرين":   ["ذهب"],
-    "مصر":       ["قمح", "أرز", "فول"],
-    "سوريا":     ["قمح", "زيتون"],
-    "السودان":   ["قمح", "ذهب"],
-    "اليمن":     ["بن", "فول"],
-    "تركيا":     ["قمح", "بطاطس", "صلب"],
-    "الأردن":    ["بطاطس", "زيتون"],
-    "فلسطين":    ["زيتون", "فول"],
-    "لبنان":     ["زيتون", "ذهب"],
-    "إسرائيل":  ["صلب", "قمح"],
-    "عُمان":     ["نفط", "غاز"],
+    "السعودية":["نفط","غاز"], "الكويت":["نفط","غاز"], "العراق":["نفط","غاز"],
+    "قطر":["غاز","نفط"],      "ليبيا":["نفط"],          "ايران":["نفط","غاز","صلب"],
+    "الامارات":["ذهب","غاز"], "البحرين":["ذهب"],         "السودان":["قمح","ذهب"],
+    "اسرائيل":["صلب","قمح"],  "عمان":["نفط","غاز"],
+    "مصر":["قمح","ارز","فول"],
+    "سوريا":["قمح","زيتون"],   "اليمن":["بن","فول"],
+    "تركيا":["قمح","بطاطس","صلب"], "الاردن":["بطاطس","زيتون"],
+    "فلسطين":["زيتون","فول"],  "لبنان":["زيتون","ذهب"],
 }
 
-# ==================== المنشآت الصناعية ====================
-# (نفط، غاز، صلب، ذهب) — تكلفة ثابتة
 RESOURCE_FACILITIES = {
-    "نفط":  {"name": "🛢️ مصفى نفط",   "base_cost": 2000, "produces": "نفط",  "amount": 3, "emoji": "🛢️"},
-    "غاز":  {"name": "⛽ محطة غاز",    "base_cost": 1800, "produces": "غاز",  "amount": 3, "emoji": "⛽"},
-    "صلب":  {"name": "⚙️ مصنع صلب",   "base_cost": 2500, "produces": "صلب",  "amount": 2, "emoji": "⚙️"},
-    "ذهب":  {"name": "🏦 بنك مركزي",   "base_cost": 3000, "produces": "ذهب",  "amount": 2, "emoji": "🏦"},
+    "نفط": {"name":"🛢️ مصفى نفط",  "base_cost":2000,"amount":3,"emoji":"🛢️"},
+    "غاز": {"name":"⛽ محطة غاز",   "base_cost":1800,"amount":3,"emoji":"⛽"},
+    "صلب": {"name":"⚙️ مصنع صلب",  "base_cost":2500,"amount":2,"emoji":"⚙️"},
+    "ذهب": {"name":"🏦 بنك مركزي", "base_cost":3000,"amount":2,"emoji":"🏦"},
 }
 
-# ==================== المزارع الزراعية ====================
-# (محاصيل) — تكلفة ديناميكية حسب السوق
 FARM_CROPS = {
-    # amount = طن/دورة لحقل واحد (10-50 طن)
-    "قمح":    {"name": "🌾 حقل قمح",       "base_cost": 400,  "amount": 35, "emoji": "🌾"},
-    "أرز":    {"name": "🍚 حقل أرز",       "base_cost": 350,  "amount": 30, "emoji": "🍚"},
-    "فول":    {"name": "🫘 حقل فول",       "base_cost": 300,  "amount": 20, "emoji": "🫘"},
-    "بن":     {"name": "☕ مزرعة بن",      "base_cost": 450,  "amount": 12, "emoji": "☕"},
-    "بطاطس":  {"name": "🥔 حقل بطاطس",    "base_cost": 250,  "amount": 40, "emoji": "🥔"},
-    "زيتون":  {"name": "🫒 بستان زيتون",   "base_cost": 350,  "amount": 15, "emoji": "🫒"},
+    "قمح":   {"name":"🌾 حقل قمح",     "base_cost":400, "amount":35,"emoji":"🌾"},
+    "ارز":   {"name":"🍚 حقل ارز",     "base_cost":350, "amount":30,"emoji":"🍚"},
+    "فول":   {"name":"🫘 حقل فول",     "base_cost":300, "amount":20,"emoji":"🫘"},
+    "بن":    {"name":"☕ مزرعة بن",    "base_cost":450, "amount":12,"emoji":"☕"},
+    "بطاطس": {"name":"🥔 حقل بطاطس",  "base_cost":250, "amount":40,"emoji":"🥔"},
+    "زيتون": {"name":"🫒 بستان زيتون","base_cost":350, "amount":15,"emoji":"🫒"},
 }
 
-# الموارد الزراعية المفضلة لكل منطقة (بتظهر أول في القائمة)
 REGION_PREFERRED_CROPS = {
-    "مصر":      ["قمح", "أرز", "فول"],
-    "سوريا":    ["قمح", "زيتون"],
-    "السودان":  ["قمح", "فول"],
-    "اليمن":    ["بن", "فول"],
-    "تركيا":    ["قمح", "بطاطس"],
-    "الأردن":   ["بطاطس", "زيتون"],
-    "فلسطين":   ["زيتون", "فول"],
-    "لبنان":    ["زيتون", "بن"],
-    "إسرائيل": ["قمح", "بطاطس"],
+    "مصر":["قمح","ارز","فول"], "سوريا":["قمح","زيتون"],
+    "السودان":["قمح","فول"],    "اليمن":["بن","فول"],
+    "تركيا":["قمح","بطاطس"],   "الاردن":["بطاطس","زيتون"],
+    "فلسطين":["زيتون","فول"],   "لبنان":["زيتون","بن"],
+    "اسرائيل":["قمح","بطاطس"],
 }
-
 ALL_CROPS = list(FARM_CROPS.keys())
 
-def get_farm_cost(data, crop):
-    """تكلفة الحقل = base_cost × معامل الطلب في السوق"""
-    base   = FARM_CROPS[crop]["base_cost"]
-    market = data.get("market", [])
-    supply = sum(o["qty"] for o in market if o.get("resource") == crop)
-    # لو العرض قليل → الطلب عالي → الحقل أغلى (الكل عايز يزرعه)
-    if supply == 0:    factor = 1.5
-    elif supply < 5:   factor = 1.25
-    elif supply < 15:  factor = 1.0
-    elif supply < 30:  factor = 0.85
-    else:              factor = 0.7
-    return max(150, int(base * factor))
-
-# الأسعار الأساسية (بتتغير حسب العرض والطلب)
-BASE_PRICES = {
-    "نفط":    800,
-    "غاز":    600,
-    "صلب":    500,
-    "ذهب":    1000,
-    "بن":     350,
-    "زيتون":  300,
-    "أرز":    250,
-    "قمح":    200,
-    "فول":    180,
-    "بطاطس":  150,
+# أسعار البيع التلقائي بعد الحصاد (ذهب/طن)
+CROP_SELL_PRICE = {
+    "قمح":5, "ارز":7, "فول":8, "بن":25, "بطاطس":3, "زيتون":18,
+    "نفط":80,"غاز":60,"صلب":50,"ذهب":100,
 }
 
 # ==================== الكوارث ====================
 DISASTERS = [
-    {"name": "زلزال مدمر",     "emoji": "🌍", "effect": "army",      "loss": (0.2, 0.4), "msg": "ضرب زلزال مدمر! خسرت جزء من جيشك!"},
-    {"name": "فيضانات",        "emoji": "🌊", "effect": "facilities","loss": (1, 2),     "msg": "فيضانات دمرت بعض منشآتك!"},
-    {"name": "جفاف شديد",      "emoji": "☀️", "effect": "resources", "loss": (0.3, 0.5), "msg": "جفاف أتلف مخزون موارد دولتك!"},
-    {"name": "وباء",           "emoji": "🦠", "effect": "army",      "loss": (0.1, 0.3), "msg": "وباء اجتاح جيشك!"},
-    {"name": "حريق مصانع",     "emoji": "🔥", "effect": "facilities","loss": (1, 1),     "msg": "حريق دمر إحدى منشآتك!"},
-    {"name": "انهيار اقتصادي", "emoji": "📉", "effect": "gold",      "loss": (0.1, 0.2), "msg": "انهيار اقتصادي! خسرت جزء من ذهبك!"},
+    {"name":"زلزال مدمر",     "emoji":"🌍","effect":"army",      "loss":(0.2,0.4),"msg":"ضرب زلزال مدمر! خسرت جزء من جيشك!"},
+    {"name":"فيضانات",        "emoji":"🌊","effect":"facilities", "loss":(1,2),    "msg":"فيضانات دمرت بعض منشآتك!"},
+    {"name":"جفاف شديد",      "emoji":"☀️","effect":"crops",     "loss":(0.3,0.5),"msg":"جفاف اثر على محاصيلك!"},
+    {"name":"وباء",           "emoji":"🦠","effect":"army",      "loss":(0.1,0.3),"msg":"وباء اجتاح جيشك!"},
+    {"name":"حريق مصانع",     "emoji":"🔥","effect":"facilities", "loss":(1,1),    "msg":"حريق دمر احدى منشآتك!"},
+    {"name":"انهيار اقتصادي", "emoji":"📉","effect":"gold",      "loss":(0.1,0.2),"msg":"انهيار اقتصادي! خسرت جزء من ذهبك!"},
 ]
 
-# ==================== نظام المستويات ====================
+# ==================== المستويات ====================
 LEVELS = [
-    {"level": 1, "name": "قرية",          "xp": 0,     "emoji": "🏘️"},
-    {"level": 2, "name": "مدينة ناشئة",   "xp": 500,   "emoji": "🏙️"},
-    {"level": 3, "name": "إمارة",         "xp": 1500,  "emoji": "🏰"},
-    {"level": 4, "name": "مملكة",         "xp": 3000,  "emoji": "👑"},
-    {"level": 5, "name": "إمبراطورية",    "xp": 6000,  "emoji": "🌟"},
-    {"level": 6, "name": "قوة عظمى",      "xp": 12000, "emoji": "⚡"},
-    {"level": 7, "name": "حضارة متقدمة", "xp": 25000, "emoji": "🚀"},
+    {"level":1,"name":"قرية",         "xp":0,    "emoji":"🏘️"},
+    {"level":2,"name":"مدينة ناشئة",  "xp":500,  "emoji":"🏙️"},
+    {"level":3,"name":"اماره",        "xp":1500, "emoji":"🏰"},
+    {"level":4,"name":"مملكة",        "xp":3000, "emoji":"👑"},
+    {"level":5,"name":"امبراطورية",   "xp":6000, "emoji":"🌟"},
+    {"level":6,"name":"قوة عظمى",    "xp":12000,"emoji":"⚡"},
+    {"level":7,"name":"حضارة متقدمة","xp":25000,"emoji":"🚀"},
 ]
 
 def get_level(xp):
@@ -261,218 +141,384 @@ def get_next_level(xp):
         if xp < l["xp"]: return l
     return None
 
-def add_xp(data, user_id, amount):
-    old = data["players"][str(user_id)].get("xp", 0)
+def add_xp(data, uid, amount):
+    old = data["players"][str(uid)].get("xp",0)
     new = old + amount
-    data["players"][str(user_id)]["xp"] = new
+    data["players"][str(uid)]["xp"] = new
     return get_level(new)["level"] > get_level(old)["level"], get_level(new)
 
-# ==================== حساب الأسعار الديناميكية ====================
-def get_current_price(data, resource):
-    base  = BASE_PRICES.get(resource, 200)
-    market= data.get("market", [])
-    # كمية المعروض من هذا المورد في السوق
-    supply = sum(o["qty"] for o in market if o.get("resource") == resource)
-    # كلما زاد العرض، انخفض السعر (وبالعكس)
-    if supply == 0:
-        factor = 1.3   # ندرة → سعر أعلى
-    elif supply < 5:
-        factor = 1.1
-    elif supply < 15:
-        factor = 1.0
-    elif supply < 30:
-        factor = 0.85
-    else:
-        factor = 0.7   # فائض → سعر أقل
-    return max(50, int(base * factor))
+# ==================== السكان والاحوال ====================
+def calc_population(p):
+    base  = 1.0
+    terr  = p.get("territories",1) * 0.3
+    crops = sum(p.get("crops",{}).values()) * 0.5
+    econ  = min(p.get("gold",0)/10000, 2.0)
+    wars  = p.get("wars_lost",0) * 0.2
+    dis   = p.get("disasters_hit",0) * 0.1
+    return round(max(0.5, base+terr+crops+econ-wars-dis), 1)
 
-# ==================== تحميل/حفظ ====================
-def load_data():
+def calc_food_security(p):
+    crops = sum(p.get("crops",{}).values())
+    pop   = calc_population(p)
+    if pop == 0: return 100
+    return min(100, int((crops*0.5/pop)*100))
+
+def calc_health(p):
+    return max(10, min(100,
+        60 + min(20, p.get("gold",0)//500) +
+        calc_food_security(p)//5 -
+        p.get("wars_lost",0)*5 -
+        p.get("disasters_hit",0)*3
+    ))
+
+def calc_happiness(p):
+    traitor = -20 if p.get("traitor") else 0
+    return max(5, min(100,
+        50 + calc_food_security(p)//4 +
+        min(20, p.get("gold",0)//1000) +
+        len(p.get("allies",[]))*3 -
+        p.get("wars_lost",0)*8 + traitor
+    ))
+
+def status_emoji(v):
+    return "🟢" if v>=80 else "🟡" if v>=50 else "🟠" if v>=25 else "🔴"
+
+def pbar(v, n=10):
+    f = int((v/100)*n)
+    return "█"*f + "░"*(n-f)
+
+# ==================== تنسيق ====================
+def sep(c="─", n=28): return c*n
+def box_title(e, t): return f"{e} *{t}*\n{sep()}"
+def progress_bar(v, mx, n=10):
+    f = int((v/mx)*n) if mx>0 else 0
+    return "█"*f + "░"*(n-f)
+
+# ==================== بيانات ====================
+
+_data_lock = asyncio.Lock()
+
+def save_data(d):
+    """حفظ آمن — atomic write + backup تلقائي"""
+    # backup قبل الحفظ
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-            if "market" not in d:        d["market"] = []
-            if "shipments" not in d:     d["shipments"] = []
-            if "straits" not in d:       d["straits"] = {k: {"blocked": False, "blocked_by": None} for k in STRAITS}
-            if "last_disaster" not in d: d["last_disaster"] = 0
-            return d
-    return {"players": {}, "pending_codes": {}, "unclaimed_lands": {},
-            "market": [], "shipments": [], "last_disaster": 0,
-            "straits": {k: {"blocked": False, "blocked_by": None} for k in STRAITS}}
+        try:
+            import shutil
+            shutil.copy2(DATA_FILE, DATA_FILE + ".bak")
+        except: pass
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DATA_FILE)  # atomic — مش ممكن يتقطع في النص
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_data():
+    """تحميل مع قراءة آمنة"""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            # لو الملف اتخرب، رجّع نسخة احتياطية
+            backup = DATA_FILE + ".bak"
+            if os.path.exists(backup):
+                with open(backup, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+            else:
+                d = {}
+    else:
+        d = {}
+    d.setdefault("players", {})
+    d.setdefault("pending_codes", {})
+    d.setdefault("market", [])
+    d.setdefault("shipments", [])
+    d.setdefault("alliance_requests", {})
+    d.setdefault("dissolve_requests", {})
+    d.setdefault("last_disaster", 0)
+    d.setdefault("wars_enabled", True)  # الأدمن يقدر يقفل الحروب
+    d.setdefault("straits", {k: {"blocked": False, "blocked_by": None} for k in STRAITS})
+    return d
 
 def generate_code():
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return "".join(random.choices(string.ascii_uppercase+string.digits, k=6))
 
-def get_player(data, user_id):
-    return data["players"].get(str(user_id))
+def get_player(d, uid):
+    p = d["players"].get(str(uid))
+    if p:
+        # تصحيح تلقائي للقيم السالبة
+        for field in ["gold","army","territories","xp"]:
+            if p.get(field,0) < 0:
+                d["players"][str(uid)][field] = 0
+    return p
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+def is_admin(uid):
+    return uid == ADMIN_ID
 
-def find_player_by_code(data, code):
-    for uid, p in data["players"].items():
+def find_by_code(d, code):
+    for uid, p in d["players"].items():
         if p.get("player_code") == code.upper():
             return uid, p
     return None, None
 
-def get_strait_status(data):
-    """يرجع حالة المضائق"""
+def find_by_name(d, name):
+    for uid, p in d["players"].items():
+        if p["country_name"] == name or p["region"] == name:
+            return uid, p
+    return None, None
+
+def new_player(region, country_name, player_id):
+    return {
+        "country_name":country_name, "region":region,
+        "gold":1000, "army":100, "territories":1,
+        "allies":[], "at_war":[], "last_tax":0,
+        "player_code":generate_code(), "xp":0,
+        "facilities":{}, "crops":{}, "crops_amount":{},
+        "infrastructure":0, "capital":"",
+        "traitor":False, "wars_lost":0, "disasters_hit":0,
+        "last_attack":0, "loans":[],
+    }
+
+def get_farm_cost(d, crop):
+    base = FARM_CROPS[crop]["base_cost"]
+    # السعر بيتغير حسب كمية المحصول عند اللاعبين
+    total = sum(sum(p.get("crops",{}).values()) for p in d["players"].values())
+    factor = 1.5 if total == 0 else max(0.7, 1.5 - total*0.02)
+    return max(150, int(base*factor))
+
+def get_strait_status(d):
     result = {}
     for name, info in STRAITS.items():
-        saved = data["straits"].get(name, {})
-        result[name] = {**info, "blocked": saved.get("blocked", False), "blocked_by": saved.get("blocked_by")}
+        saved = d["straits"].get(name, {})
+        result[name] = {**info, "blocked":saved.get("blocked",False), "blocked_by":saved.get("blocked_by")}
     return result
 
-def is_shipment_blocked(data, seller_region, buyer_region):
-    """يتحقق لو الشحنة هتتأخر بسبب مضيق مغلق"""
-    straits = get_strait_status(data)
-    for name, s in straits.items():
+def is_shipment_blocked(d, seller_reg, buyer_reg):
+    for name, s in get_strait_status(d).items():
         if s["blocked"]:
-            if seller_region in s["affects"] or buyer_region in s["affects"]:
+            if seller_reg in s["affects"] or buyer_reg in s["affects"]:
                 return True, name
     return False, None
 
-def calc_ship_time(seller_region, buyer_region):
-    """يحسب وقت الشحن بالثواني (بيرجع وقت حقيقي)"""
-    base = random.randint(int(SHIP_MIN), int(SHIP_MAX))
-    return base
+def clean_old_requests(d):
+    """امسح طلبات التحالف المنتهية (alliance + dissolve)"""
+    now = time.time()
+    d["alliance_requests"] = {
+        k: v for k, v in d.get("alliance_requests", {}).items()
+        if now - v.get("time", 0) < ALLY_REQ_TTL
+    }
+    # dissolve_requests مفيهاش time — امسح اللي عمرها +1 ساعة
+    d.setdefault("dissolve_requests", {})
+    # مش محتاجين نمسحهم لأنهم مرتبطين بزرار تليجرام
 
 # ==================== الخريطة ====================
-def generate_map(players, data):
+def generate_map(players, d):
     img  = Image.open(MAP_FILE).convert("RGBA")
     draw = ImageDraw.Draw(img)
-    straits = get_strait_status(data)
-
+    straits = get_strait_status(d)
     for uid, p in players.items():
         region    = p.get("region")
-        cname     = p.get("country_name", region)
         flag_path = os.path.join(FLAGS_DIR, f"{region}.png")
         if region not in REGION_COORDS: continue
-        for i, (cx, cy) in enumerate(REGION_COORDS[region]):
-            size = FLAG_SIZE_MAIN if i == 0 else FLAG_SIZE_SMALL
+        for i, (cx,cy) in enumerate(REGION_COORDS[region]):
+            size = FLAG_SIZE_MAIN if i==0 else FLAG_SIZE_SMALL
             if os.path.exists(flag_path):
-                flag = Image.open(flag_path).convert("RGBA")
-                flag = flag.resize((size, int(size*0.6)), Image.LANCZOS)
-                fw, fh = flag.size; fx, fy = cx-fw//2, cy-fh//2
-                img.paste(flag, (fx, fy), flag)
+                flag = Image.open(flag_path).convert("RGBA").resize((size, int(size*0.6)), Image.LANCZOS)
+                fw,fh = flag.size; fx,fy = cx-fw//2, cy-fh//2
+                img.paste(flag,(fx,fy),flag)
                 draw.rectangle([fx-3,fy-3,fx+fw+3,fy+fh+3], outline="white", width=4)
-                if i == 0:
-                    lvl   = get_level(p.get("xp", 0))
-                    draw.text((cx, fy+fh+6), f"{lvl['emoji']} {cname}", fill="black", anchor="mt")
+                if i==0:
+                    lvl  = get_level(p.get("xp",0))
+                    name = p.get("country_name","")
+                    tag  = " 🗡️" if p.get("traitor") else ""
+                    draw.text((cx,fy+fh+6), f"{lvl['emoji']}{name}{tag}", fill="black", anchor="mt")
             else:
-                r = 30 if i == 0 else 15
+                r = 30 if i==0 else 15
                 draw.ellipse([cx-r,cy-r,cx+r,cy+r], fill="#e74c3c", outline="white", width=3)
-                if i == 0:
-                    draw.text((cx, cy+r+6), cname, fill="black", anchor="mt")
-
-    # رسم المضائق
-    strait_positions = {"هرمز": (1400, 1050), "باب المندب": (1100, 1550)}
-    for name, pos in strait_positions.items():
-        s   = straits.get(name, {})
+    # المضائق
+    strait_pos = {"هرمز":(1400,1050),"باب المندب":(1100,1550),"السويس":(500,950)}
+    for name, pos in strait_pos.items():
+        s = straits.get(name,{})
         col = "red" if s.get("blocked") else "cyan"
-        cx, cy = pos
+        cx,cy = pos
         draw.ellipse([cx-20,cy-20,cx+20,cy+20], fill=col, outline="white", width=3)
-        draw.text((cx, cy+25), f"{'🔴' if s.get('blocked') else '🟢'}{name}", fill="white", anchor="mt")
-
+        draw.text((cx,cy+25), f"{'🔴' if s.get('blocked') else '🟢'}{name}", fill="white", anchor="mt")
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
+    img.save(buf, format="PNG"); buf.seek(0)
     return buf
 
-# ==================== كوارث تلقائية ====================
+# ==================== الحصاد التلقائي ====================
+async def do_harvest(app, uid, p, data):
+    """ينفذ حصاد وبيع تلقائي — يشمل الأراضي حتى بدون مزارع"""
+    crops_p      = p.get("crops",{})
+    crops_amount = p.get("crops_amount",{})
+
+    region    = p.get("region","")
+    preferred = REGION_PREFERRED_CROPS.get(region,[])
+    total_gold = 0
+    total_tons = 0
+    lines      = []
+
+    for crop, count in crops_p.items():
+        fc      = FARM_CROPS.get(crop, {})
+        amt_per = crops_amount.get(crop, fc.get("amount",10))
+        # بونص المنطقة
+        if crop in preferred:
+            amt_per = int(amt_per * 1.5)
+        qty       = amt_per * count
+        price     = CROP_SELL_PRICE.get(crop, 5)
+        gold_earned = qty * price
+        total_gold += gold_earned
+        total_tons += qty
+        lines.append(f"  {fc.get('emoji','🌾')} {qty}طن {crop} → +{gold_earned:,}ذ")
+
+    # الانتاج الصناعي
+    facs = p.get("facilities",{})
+    for res, count in facs.items():
+        fc       = RESOURCE_FACILITIES.get(res,{})
+        qty      = fc.get("amount",2) * count
+        price    = CROP_SELL_PRICE.get(res, 50)
+        gold_e   = qty * price
+        total_gold += gold_e
+        lines.append(f"  {fc.get('emoji','🏭')} {qty} {res} → +{gold_e:,}ذ")
+
+    # دخل الاراضي دايماً
+    terr_income = p.get("territories",1)*50 + 200
+    total_gold += terr_income
+
+    # سداد القروض التلقائي
+    loans     = p.get("loans",[])
+    loan_msgs = []
+    new_loans = []
+    for loan in loans:
+        loan["remaining_cycles"] = loan.get("remaining_cycles",1) - 1
+        if loan["remaining_cycles"] <= 0:
+            due = loan["due"]
+            if data["players"][str(uid)]["gold"] + total_gold >= due:
+                total_gold -= due
+                loan_msgs.append(f"   🏦 سُدِّد قرض {loan['name']}: -{due:,}ذ ✅")
+            else:
+                # عقوبة عدم السداد
+                penalty = int(due * 0.5)
+                data["players"][str(uid)]["gold"] = max(0, data["players"][str(uid)]["gold"] - penalty)
+                loan_msgs.append(f"   ⚠️ قرض {loan['name']} متأخر! عقوبة: -{penalty:,}ذ")
+                loan["remaining_cycles"] = 2  # فرصة إضافية
+                new_loans.append(loan)
+        else:
+            new_loans.append(loan)
+    data["players"][str(uid)]["loans"] = new_loans
+
+    data["players"][str(uid)]["gold"]    += total_gold
+    data["players"][str(uid)]["last_tax"] = time.time()
+    leveled_up, new_lvl = add_xp(data, uid, 50 + p.get("territories",1)*10)
+
+    # لو مفيش إنتاج ومفيش قروض، ابعت رسالة مختصرة
+    if not lines and not loan_msgs:
+        msg = (
+            f"💰 *دخل الأراضي التلقائي*\n{sep()}\n"
+            f"🗺️ {p['territories']} منطقة: +{terr_income:,}ذ\n"
+            f"💰 الرصيد: *{p['gold']+total_gold:,}*\n"
+            f"⏳ القادم بعد 15 دقيقة\n"
+            f"💡 ابنِ مزارع أو منشآت لزيادة الدخل!"
+        )
+    else:
+        prod_txt = "\n".join(lines) if lines else "  (لا يوجد إنتاج)"
+        loan_txt = "\n".join(loan_msgs) if loan_msgs else ""
+        msg = (
+            f"{box_title('💰','الحصاد التلقائي')}\n\n"
+            f"📦 *الإنتاج:*\n{prod_txt}\n"
+            f"  🗺️ دخل الأراضي: +{terr_income:,}ذ\n"
+            f"{sep()}\n"
+            f"  🌾 الكمية: ~{total_tons} طن\n"
+            f"  💰 المضاف: *+{total_gold:,}*\n"
+            f"  💰 الرصيد: *{p['gold']+total_gold:,}*"
+        )
+        if loan_txt:
+            msg += f"\n{sep()}\n🏦 *القروض:*\n{loan_txt}"
+    if leveled_up:
+        msg += f"\n🎊 *ترقية!* {new_lvl['name']} {new_lvl['emoji']}"
+    msg += f"\n{sep()}\n⏳ القادم بعد 15 دقيقة"
+    try:
+        await app.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown")
+    except: pass
+
+# ==================== loops ====================
 async def disaster_loop(app):
-    """تشغيل كوارث تلقائية كل أسبوع لعبة = 21 دقيقة"""
     await asyncio.sleep(DISASTER_EVERY)
     while True:
         try:
             data = load_data()
             if data["players"]:
-                # اختيار دولة عشوائية
-                uid  = random.choice(list(data["players"].keys()))
+                # اختار دولة عشوائية من دول مختلفة عن آخر كارثة
+                uids = list(data["players"].keys())
+                uid  = random.choice(uids)
                 p    = data["players"][uid]
                 d    = random.choice(DISASTERS)
                 loss = 0
 
                 if d["effect"] == "army":
                     pct  = random.uniform(*d["loss"])
-                    loss = max(10, int(p["army"] * pct))
-                    data["players"][uid]["army"] = max(0, p["army"] - loss)
+                    loss = max(10, int(p["army"]*pct))
+                    data["players"][uid]["army"] = max(0, p["army"]-loss)
                 elif d["effect"] == "gold":
                     pct  = random.uniform(*d["loss"])
-                    loss = max(50, int(p["gold"] * pct))
-                    data["players"][uid]["gold"] = max(0, p["gold"] - loss)
+                    loss = max(50, int(p["gold"]*pct))
+                    data["players"][uid]["gold"] = max(0, p["gold"]-loss)
                 elif d["effect"] == "facilities":
-                    facs = p.get("facilities", {})
+                    facs = p.get("facilities",{})
                     if facs:
                         res  = random.choice(list(facs.keys()))
-                        loss = random.randint(1, min(2, facs[res]))
-                        data["players"][uid]["facilities"][res] = max(0, facs[res] - loss)
-                        if data["players"][uid]["facilities"][res] == 0:
+                        loss = random.randint(1, min(2,facs[res]))
+                        data["players"][uid]["facilities"][res] = max(0,facs[res]-loss)
+                        if data["players"][uid]["facilities"][res]==0:
                             del data["players"][uid]["facilities"][res]
-                elif d["effect"] == "resources":
-                    inv = p.get("inventory", {})
-                    if inv:
-                        res = random.choice(list(inv.keys()))
+                elif d["effect"] == "crops":
+                    crops = p.get("crops",{})
+                    if crops:
+                        res = random.choice(list(crops.keys()))
                         pct = random.uniform(*d["loss"])
-                        loss = max(1, int(inv[res] * pct))
-                        data["players"][uid]["inventory"][res] = max(0, inv[res] - loss)
+                        data["players"][uid]["crops"][res] = max(0, int(crops[res]*(1-pct)))
 
-                data["players"][uid]["disasters_hit"] = data["players"][uid].get("disasters_hit",0) + 1
+                data["players"][uid]["disasters_hit"] = p.get("disasters_hit",0)+1
                 data["last_disaster"] = time.time()
                 save_data(data)
-
                 try:
-                    await app.bot.send_message(
-                        chat_id=int(uid),
-                        text=f"{d['emoji']} *كارثة طبيعية!*\n"
-                             f"{'─'*28}\n"
-                             f"ضربت *{p['country_name']}* كارثة {d['name']}!\n\n"
-                             f"📢 {d['msg']}\n"
-                             f"{'─'*28}\n"
-                             f"💔 الخسارة: *{loss}*\n"
-                             f"💪 صمود دولتك يحدد مستقبلها!",
-                        parse_mode="Markdown"
-                    )
+                    await app.bot.send_message(chat_id=int(uid),
+                        text=f"{d['emoji']} *كارثة طبيعية!*\n{sep()}\n"
+                             f"ضربت *{p['country_name']}* كارثة {d['name']}!\n"
+                             f"📢 {d['msg']}\n{sep()}\n💔 الخسارة: *{loss}*",
+                        parse_mode="Markdown")
                 except: pass
-
         except Exception as e:
-            logging.error(f"Disaster loop error: {e}")
-
+            logging.error(f"Disaster loop: {e}")
         await asyncio.sleep(DISASTER_EVERY)
 
-# ==================== شحنات ====================
-async def shipment_loop(app):
-    """يتحقق من الشحنات الواصلة كل دقيقة"""
+_harvest_lock = asyncio.Lock()
+
+async def harvest_loop(app):
+    """كل دقيقة يتحقق — لو اللاعب وصل cooldown، يحصد تلقائياً
+       + يمسح الشحنات القديمة (+24 ساعة)"""
+    await asyncio.sleep(TAX_COOLDOWN)
     while True:
-        await asyncio.sleep(60)
         try:
-            data     = load_data()
-            now      = time.time()
-            arrived  = [s for s in data["shipments"] if s["arrive_at"] <= now]
-            pending  = [s for s in data["shipments"] if s["arrive_at"] > now]
+            async with _harvest_lock:
+                data = load_data()
+                now  = time.time()
+                harvested = False
 
-            for s in arrived:
-                buyer_uid = s["buyer_uid"]
-                if buyer_uid in data["players"]:
-                    inv = data["players"][buyer_uid].get("inventory", {})
-                    inv[s["resource"]] = inv.get(s["resource"], 0) + s["qty"]
-                    data["players"][buyer_uid]["inventory"] = inv
-                    try:
-                        await app.bot.send_message(
-                            chat_id=int(buyer_uid),
-                            text=f"📦 *وصلت شحنتك!*\n\n{s['qty']} وحدة من *{s['resource']}* وصلت من {s['seller']}! ✅",
-                            parse_mode="Markdown"
-                        )
-                    except: pass
+                # مسح الشحنات المنتهية الصلاحية (+24 ساعة)
+                data["shipments"] = [
+                    s for s in data.get("shipments", [])
+                    if now - s.get("sent_at", 0) < 86400
+                ]
 
-            data["shipments"] = pending
-            save_data(data)
+                for uid, p in list(data["players"].items()):
+                    if now - p.get("last_tax", 0) >= TAX_COOLDOWN:
+                        await do_harvest(app, uid, p, data)
+                        harvested = True
+                if harvested:
+                    save_data(data)
         except Exception as e:
-            logging.error(f"Shipment loop error: {e}")
+            logging.error(f"Harvest loop: {e}")
+        await asyncio.sleep(60)
 
 # ==================== معالج الرسائل ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -483,1126 +529,850 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = ""
 
-    user_id   = update.effective_user.id
-    user_name = update.effective_user.first_name
-    data      = load_data()
+    uid   = update.effective_user.id
+    uname = update.effective_user.first_name
+    data  = load_data()
+    clean_old_requests(data)
 
-    # ======= أدمن: إنشاء دولة مع علم =======
-    if is_admin(user_id) and update.message.photo and text.startswith("دولة "):
+    # ======= أدمن: انشاء دولة بعلم =======
+    if is_admin(uid) and update.message.photo and text.startswith("دولة "):
         parts = text.split()
         if len(parts) < 4:
-            await update.message.reply_text("❌ الصيغة:\n`دولة [المنطقة] [اسم] [الكود]`", parse_mode="Markdown"); return
-        code = parts[-1].upper(); region = parts[1]; country_name = " ".join(parts[2:-1])
+            await update.message.reply_text("الصيغة:\n`دولة [المنطقة] [اسم] [الكود]`", parse_mode="Markdown"); return
+        code   = parts[-1].upper()
+        region = parts[1]
+        cname  = " ".join(parts[2:-1])
         if code not in data["pending_codes"]:
-            await update.message.reply_text(f"❌ الكود `{code}` مش موجود.", parse_mode="Markdown"); return
+            await update.message.reply_text(f"الكود `{code}` مش موجود.", parse_mode="Markdown"); return
         if region not in AVAILABLE_REGIONS:
-            await update.message.reply_text(f"⚠️ '{region}' مش في القائمة."); return
-        for uid, p in data["players"].items():
+            await update.message.reply_text(f"'{region}' مش في القائمة."); return
+        for _, p in data["players"].items():
             if p["region"] == region:
-                await update.message.reply_text(f"❌ '{region}' محجوزة."); return
-        photo = update.message.photo[-1]
-        ff    = await context.bot.get_file(photo.file_id)
+                await update.message.reply_text(f"'{region}' محجوزة."); return
+        photo  = update.message.photo[-1]
+        ff     = await context.bot.get_file(photo.file_id)
         await ff.download_to_drive(os.path.join(FLAGS_DIR, f"{region}.png"))
-        player_id   = data["pending_codes"].pop(code)
-        player_code = generate_code()
-        res         = REGION_RESOURCES.get(region, [])
-        data["players"][str(player_id)] = {
-            "country_name": country_name, "region": region,
-            "gold": 1000, "army": 100, "factories": 1, "farms": 1,
-            "territories": 1, "allies": [], "at_war": [],
-            "last_tax": 0, "player_code": player_code, "xp": 0,
-            "facilities": {}, "inventory": {},
-        }
+        pid    = data["pending_codes"].pop(code)
+        pl     = new_player(region, cname, pid)
+        res    = REGION_RESOURCES.get(region, [])
+        data["players"][str(pid)] = pl
         save_data(data)
-        res_txt = "، ".join(res) if res else "لا يوجد"
         await update.message.reply_text(
-            f"✅ تم!\n🏳️ *{country_name}* ← {region}\n"
-            f"🔑 كود اللاعب: `{player_code}`\n"
-            f"🌍 موارد المنطقة: {res_txt}",
-            parse_mode="Markdown")
+            f"✅ تم!\n🏳️ *{cname}* ← {region}\n🔑 `{pl['player_code']}`", parse_mode="Markdown")
         try:
-            await context.bot.send_message(chat_id=player_id,
-                text=f"🎊 *تم تفعيل دولتك!*\n"
-                     f"{sep('═')}\n\n"
-                     f"🏳️ *{country_name}*\n"
-                     f"🗺️ المنطقة: {region}\n"
-                     f"🌍 الموارد: {res_txt}\n\n"
-                     f"{sep('─')}\n"
-                     f"💰 ذهب ابتدائي: 1,000\n"
-                     f"⚔️ جيش ابتدائي: 100\n\n"
-                     f"📖 اكتب *مساعدة* لشوف الأوامر!", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=pid,
+                text=f"🎊 *تم تفعيل دولتك!*\n{sep('═')}\n"
+                     f"🏳️ *{cname}* | 🗺️ {region}\n"
+                     f"🌍 الموارد: {', '.join(res) if res else 'لا يوجد'}\n{sep()}\n"
+                     f"💰 ذهب: 1,000 | ⚔️ جيش: 100\n📖 اكتب *مساعدة*", parse_mode="Markdown")
         except: pass
         return
 
     # ======= انشاء دولة =======
     if text == "انشاء دولة":
-        player = get_player(data, user_id)
-        if player:
-            await update.message.reply_text(f"⚠️ عندك دولة: *{player['country_name']}*", parse_mode="Markdown"); return
-        existing = next((c for c, uid in data["pending_codes"].items() if uid == user_id), None)
+        if get_player(data, uid):
+            await update.message.reply_text(f"⚠️ عندك دولة بالفعل."); return
+        existing = next((c for c,v in data["pending_codes"].items() if v==uid), None)
         if existing:
             await update.message.reply_text(f"⏳ كودك: `{existing}`", parse_mode="Markdown"); return
         code = generate_code()
         while code in data["pending_codes"]: code = generate_code()
-        data["pending_codes"][code] = user_id; save_data(data)
+        data["pending_codes"][code] = uid; save_data(data)
         await update.message.reply_text(
-            f"{box_title('🎮', 'طلب إنشاء دولة')}\n\n"
-            f"أهلاً *{user_name}*! تم تسجيل طلبك ✅\n\n"
-            f"🔑 *كودك الشخصي:*\n"
-            f"┌─────────────┐\n"
-            f"│  `{code}`  │\n"
-            f"└─────────────┘\n\n"
-            f"📌 *الخطوات القادمة:*\n"
-            f"1️⃣ ابعت الكود ده للأدمن\n"
-            f"2️⃣ اختار اسم دولتك ومنطقتك\n"
-            f"3️⃣ استنى تفعيل دولتك 🏳️",
-            parse_mode="Markdown")
+            f"{box_title('🎮','طلب انشاء دولة')}\n\nاهلاً *{uname}*! ✅\n\n"
+            f"🔑 كودك:\n┌─────────────┐\n│  `{code}`  │\n└─────────────┘\n\n"
+            f"ابعت الكود للادمن!", parse_mode="Markdown")
         return
 
     # ======= كودي =======
-    if text in ["كودي", "الكود"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        await update.message.reply_text(f"🔑 كودك:\n```\n{player.get('player_code','')}```", parse_mode="Markdown")
+    if text in ["كودي","الكود"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        await update.message.reply_text(f"🔑 كودك:\n```\n{p['player_code']}```", parse_mode="Markdown")
         return
 
     # ======= حالة دولتي =======
-    if text in ["حالة دولتي", "دولتي", "وضعي"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        p   = player
-        xp  = p.get("xp", 0)
-        lvl = get_level(xp)
-        nxt = get_next_level(xp)
-        nxt_txt = f"{nxt['xp']-xp:,} XP للمستوى القادم" if nxt else "🏆 أعلى مستوى!"
-        left = TAX_COOLDOWN - (time.time() - p.get("last_tax", 0))
-        tax  = "✅ جاهزة" if left <= 0 else f"⏳ {int(left//60)}:{int(left%60):02d}"
+    if text in ["حالة دولتي","دولتي","وضعي"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        xp   = p.get("xp",0)
+        lvl  = get_level(xp)
+        nxt  = get_next_level(xp)
+        nxt_txt = f"{nxt['xp']-xp:,} XP للمستوى القادم" if nxt else "🏆 اعلى مستوى!"
+        left = TAX_COOLDOWN - (time.time()-p.get("last_tax",0))
+        tax  = "✅ جاهزة" if left<=0 else f"⏳ {int(left//60)}:{int(left%60):02d}"
+        facs = p.get("facilities",{})
+        fac_txt = "\n".join(f"  {RESOURCE_FACILITIES[r]['emoji']} {RESOURCE_FACILITIES[r]['name']}: {c}" for r,c in facs.items()) or "  لا يوجد"
+        crops_p = p.get("crops",{})
+        crops_txt = "\n".join(f"  {FARM_CROPS[c]['emoji']} {FARM_CROPS[c]['name']}: {n} حقل" for c,n in crops_p.items()) or "  لا يوجد"
+        total_tons = sum(
+            FARM_CROPS.get(c,{}).get("amount",0)*n*(1.5 if c in REGION_PREFERRED_CROPS.get(p["region"],[]) else 1)
+            for c,n in crops_p.items()
+        )
+        res     = REGION_RESOURCES.get(p["region"],[])
+        capital = p.get("capital","غير محددة")
+        infra   = p.get("infrastructure",0)
+        traitor = " 🗡️خائن" if p.get("traitor") else ""
+        xp_bar  = progress_bar(xp-lvl["xp"], (nxt["xp"]-lvl["xp"]) if nxt else 1)
+        econ    = p["territories"]*50+200 + sum(RESOURCE_FACILITIES.get(r,{}).get("amount",0)*c*CROP_SELL_PRICE.get(r,0) for r,c in facs.items())
+        pop     = calc_population(p)
+        food    = calc_food_security(p)
+        health  = calc_health(p)
+        happy   = calc_happiness(p)
+        # القروض النشطة
+        loans_active = p.get("loans",[])
+        loans_txt = ""
+        for ln in loans_active:
+            loans_txt += f"  🏦 {ln['name']}: يُسدَّد {ln['due']:,}ذ بعد {ln['remaining_cycles']} دورة\n"
+        if not loans_txt: loans_txt = "  لا يوجد"
 
-        # المنشآت
-        facs = p.get("facilities", {})
-        fac_txt = "\n".join(f"  {RESOURCE_FACILITIES[r]['emoji']} {RESOURCE_FACILITIES[r]['name']}: {c}" for r, c in facs.items()) if facs else "  لا يوجد"
+        allies  = ", ".join(p.get("allies",[])) or "—"
+        wars    = ", ".join(p.get("at_war",[])) or "في سلام ☮️"
 
-        # المخزون
-        inv     = p.get("inventory", {})
-        inv_txt = " | ".join(f"{r}: {q}" for r, q in inv.items()) if inv else "فارغ"
-
-        res      = REGION_RESOURCES.get(p["region"], [])
-        crops_p  = p.get("crops", {})
-        crops_txt = "\n".join(f"  {FARM_CROPS[c]['emoji']} {FARM_CROPS[c]['name']}: {n}" for c, n in crops_p.items()) if crops_p else "  لا يوجد"
-        capital  = p.get("capital", "غير محددة")
-        infra    = p.get("infrastructure", 0)
-        xp_bar = progress_bar(xp - get_level(xp)["xp"],
-                               (nxt["xp"] - get_level(xp)["xp"]) if nxt else 1)
-        await update.message.reply_text(
-            f"{lvl['emoji']} *{p['country_name']}*\n"
-            f"{sep('═')}\n"
-            f"🏅 المستوى {lvl['level']}: *{lvl['name']}*\n"
-            f"⭐ `{xp_bar}` {xp:,} XP\n"
-            f"   {nxt_txt}\n\n"
-            f"🗺️ *الموقع:*\n"
-            f"   📍 المنطقة: {p['region']}\n"
-            f"   🏛️ العاصمة: {capital}\n"
-            f"   🌍 الموارد: {', '.join(res) if res else '—'}\n"
-            f"   🏗️ البنية التحتية: Lv.{infra}\n"
+        msg1 = (
+            f"{lvl['emoji']} *{p['country_name']}*{traitor}\n{sep('═')}\n"
+            f"🏅 Lv.{lvl['level']}: *{lvl['name']}*\n"
+            f"⭐ `{xp_bar}` {xp:,} XP | {nxt_txt}\n\n"
+            f"📍 {p['region']} | 🏛️ {capital} | 🏗️ Lv.{infra}\n"
+            f"🌍 الموارد: {', '.join(res) or '—'}\n"
             f"{sep()}\n"
-            f"📊 *الإحصائيات:*\n"
-            f"   💰 ذهب:   {p['gold']:,}\n"
-            f"   ⚔️  جيش:   {p['army']:,}\n"
-            f"   🗺️ أراضي: {p['territories']}\n"
+            f"💰 الخزينة: *{p['gold']:,}* ذهب\n"
+            f"📈 دخل تقديري: ~{econ:,}/دورة\n"
+            f"⚔️ الجيش: {p['army']:,} | 🗺️ الاراضي: {p['territories']}\n"
             f"{sep()}\n"
-            f"🏭 *المنشآت الصناعية:*\n{fac_txt}\n"
-            f"🌾 *المزارع:*\n{crops_txt}\n"
+            f"🏭 المنشآت:\n{fac_txt}\n"
+            f"🌾 المزارع:\n{crops_txt}\n"
+            f"   📦 ناتج: ~{int(total_tons)} طن/دورة\n"
             f"{sep()}\n"
-            f"📦 *المخزون:* {inv_txt}\n"
-            f"{sep()}\n"
-            f"💵 جمع الضرائب: {tax}\n"
-            f"🤝 تحالفات: {', '.join(p['allies']) if p['allies'] else '—'}\n"
-            f"⚔️  حروب: {', '.join(p['at_war']) if p.get('at_war') else 'في سلام'}",
-            parse_mode="Markdown")
+            f"💵 الحصاد التالي: {tax}\n"
+            f"🏦 *القروض:*\n{loans_txt}\n"
+            f"🤝 {allies} | ⚔️ {wars}"
+        )
+        msg2 = (
+            f"👥 *السكان والاحوال — {p['country_name']}*\n{sep('═')}\n"
+            f"🧑‍🤝‍🧑 السكان: *{pop}M* نسمة\n{sep()}\n"
+            f"🌾 الامن الغذائي:\n   {status_emoji(food)} `{pbar(food)}` {food}%\n"
+            f"❤️ الصحة العامة:\n   {status_emoji(health)} `{pbar(health)}` {health}%\n"
+            f"😊 الرضا الاجتماعي:\n   {status_emoji(happy)} `{pbar(happy)}` {happy}%"
+        )
+        await update.message.reply_text(msg1, parse_mode="Markdown")
+        await update.message.reply_text(msg2, parse_mode="Markdown")
         return
 
-    # ======= بناء منشأة صناعية =======
-    if text in ["بناء منشأة", "بناء منشأه", "انشئ منشأة"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        region    = player["region"]
-        res_avail = [r for r in REGION_RESOURCES.get(region, []) if r in RESOURCE_FACILITIES]
-        infra     = player.get("infrastructure", 0)
-
-        # الدول الزراعية محتاجة بنية تحتية عشان تبني منشآت صناعية
-        AGRI_REGIONS = list(REGION_PREFERRED_CROPS.keys())
-        if region in AGRI_REGIONS and not res_avail:
-            # بتحقق لو عندهم بنية تحتية كافية للمنشآت المتاحة ليهم
+    # ======= بناء منشاة صناعية =======
+    if text in ["بناء منشاة","بناء منشأة","انشئ منشاة"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        region    = p["region"]
+        res_avail = [r for r in REGION_RESOURCES.get(region,[]) if r in RESOURCE_FACILITIES]
+        infra     = p.get("infrastructure",0)
+        AGRI = list(REGION_PREFERRED_CROPS.keys())
+        if region in AGRI and not res_avail:
             unlocked = []
-            if infra >= 1: unlocked.append("صلب")
-            if infra >= 2: unlocked += ["نفط", "غاز"]
-            if infra >= 3: unlocked.append("ذهب")
+            if infra>=1: unlocked.append("صلب")
+            if infra>=2: unlocked+=["نفط","غاز"]
+            if infra>=3: unlocked.append("ذهب")
             if not unlocked:
                 await update.message.reply_text(
-                    f"❌ منطقتك ({region}) زراعية!\n\n"
-                    f"عشان تبني منشآت صناعية محتاج *بنية تحتية* أول:\n"
-                    f"• المستوى 1 (1,500 ذ) → مصنع صلب ⚙️\n"
-                    f"• المستوى 2 (2,500 ذ) → مصفى نفط/غاز 🛢️\n"
-                    f"• المستوى 3 (3,500 ذ) → بنك مركزي 🏦\n\n"
-                    f"اكتب: `بناء بنية تحتية`", parse_mode="Markdown"); return
+                    f"❌ منطقتك زراعية!\nابن *بنية تحتية* اولاً:\n"
+                    f"• Lv.1 (1,500ذ) ← صلب ⚙️\n• Lv.2 (2,500ذ) ← نفط/غاز\n• Lv.3 (3,500ذ) ← بنك",
+                    parse_mode="Markdown"); return
             res_avail = unlocked
-
         if not res_avail:
-            await update.message.reply_text(
-                f"❌ منطقتك ({region}) ما عندهاش موارد صناعية.\nجرب *بناء مزرعة*.", parse_mode="Markdown"); return
-        keyboard = []
-        for r in res_avail:
-            f = RESOURCE_FACILITIES[r]
-            keyboard.append([InlineKeyboardButton(
-                f"{f['emoji']} {f['name']} {f['base_cost']}ذ +{f['amount']}{r}",
-                callback_data=f"build_{r}"
-            )])
-        keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
-
-        # جدول تفصيلي في الرسالة
-        table = ""
-        for r in res_avail:
-            f = RESOURCE_FACILITIES[r]
-            table += f"{f['emoji']} {f['name']}: {f['base_cost']:,}ذ → +{f['amount']} {r}/دورة\n"
-
+            await update.message.reply_text("❌ منطقتك مش عندها موارد صناعية. جرب *بناء مزرعة*.", parse_mode="Markdown"); return
+        table = "".join(f"{RESOURCE_FACILITIES[r]['emoji']} {RESOURCE_FACILITIES[r]['name']}: {RESOURCE_FACILITIES[r]['base_cost']:,}ذ → +{RESOURCE_FACILITIES[r]['amount']} {r}/دورة\n" for r in res_avail)
+        kbd = [[InlineKeyboardButton(f"{RESOURCE_FACILITIES[r]['emoji']} {r.upper()} {RESOURCE_FACILITIES[r]['base_cost']}ذ", callback_data=f"build_{r}")] for r in res_avail]
+        kbd.append([InlineKeyboardButton("❌ الغاء", callback_data="cancel")])
         await update.message.reply_text(
-            f"🏗️ *اختار المنشأة الصناعية:*\n\n"
-            f"الموارد في {region}: {', '.join(res_avail)}\n\n"
-            f"{table}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown")
+            f"🏗️ *اختار المنشاة:*\n\n{table}",
+            reply_markup=InlineKeyboardMarkup(kbd), parse_mode="Markdown")
         return
 
     # ======= بناء مزرعة =======
-    if text in ["بناء مزرعة", "ابني مزرعة", "انشئ مزرعة"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        region    = player["region"]
-        preferred = REGION_PREFERRED_CROPS.get(region, [])
-        sorted_crops = preferred + [c for c in ALL_CROPS if c not in preferred]
-        keyboard = []
-        row = []
-        for crop in sorted_crops:
+    if text in ["بناء مزرعة","ابني مزرعة","انشئ مزرعة"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        region    = p["region"]
+        preferred = REGION_PREFERRED_CROPS.get(region,[])
+        sorted_c  = preferred + [c for c in ALL_CROPS if c not in preferred]
+        table = ""
+        kbd   = []
+        row   = []
+        for crop in sorted_c:
             fc   = FARM_CROPS[crop]
             cost = get_farm_cost(data, crop)
             star = "⭐" if crop in preferred else ""
-            # نص مختصر يناسب أزرار تليجرام
-            btn  = InlineKeyboardButton(
-                f"{fc['emoji']}{star}{crop} {cost}ذ +{fc['amount']}",
-                callback_data=f"farm_{crop}"
-            )
-            row.append(btn)
-            if len(row) == 2:
-                keyboard.append(row); row = []
-        if row: keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
-        pref_txt = f"⭐ مناسب لمنطقتك: {', '.join(preferred)}" if preferred else "يمكنك زراعة أي محصول"
-
-        # جدول تفصيلي في الرسالة
-        table = ""
-        for crop in sorted_crops:
-            fc   = FARM_CROPS[crop]
-            cost = get_farm_cost(data, crop)
-            star = "⭐" if crop in preferred else "  "
-            table += f"{star}{fc['emoji']} {crop}: {cost}ذ → +{fc['amount']}/دورة\n"
-
+            real_amt = int(fc["amount"]*1.5) if crop in preferred else fc["amount"]
+            table += f"{fc['emoji']}{star} {crop}: {cost}ذ → {real_amt}طن/حقل/دورة\n"
+            row.append(InlineKeyboardButton(f"{fc['emoji']}{star}{crop} {cost}ذ", callback_data=f"farm_{crop}"))
+            if len(row)==2: kbd.append(row); row=[]
+        if row: kbd.append(row)
+        kbd.append([InlineKeyboardButton("❌ الغاء", callback_data="cancel")])
+        pref_txt = f"⭐ مناسب لمنطقتك: {', '.join(preferred)}" if preferred else "تقدر تزرع اي محصول"
         await update.message.reply_text(
-            f"🌾 *اختار المحصول:*\n\n"
-            f"{pref_txt}\n\n"
-            f"{table}\n"
-            f"⭐ = إنتاج أعلى بـ50% لمنطقتك",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown")
+            f"🌾 *اختار المحصول:*\n\n{pref_txt}\n{sep()}\n{table}\n⭐ = انتاج اعلى 50%",
+            reply_markup=InlineKeyboardMarkup(kbd), parse_mode="Markdown")
         return
 
-    # ======= جمع الضرائب =======
-    if text in ["جمع الضرائب", "اجمع الضرائب", "جمع موارد"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        now  = time.time()
-        left = TAX_COOLDOWN - (now - player.get("last_tax", 0))
-        if left > 0:
+    # ======= جمع الحصاد يدوياً =======
+    if text in ["جمع الضرائب","اجمع الضرائب","حصاد","جمع موارد"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        left = TAX_COOLDOWN - (time.time()-p.get("last_tax",0))
+        if left>0:
             await update.message.reply_text(f"⏳ استنى *{int(left//60)}:{int(left%60):02d}* دقيقة!", parse_mode="Markdown"); return
+        # lock لمنع التعارض مع harvest_loop
+        async with _harvest_lock:
+            data2 = load_data()  # إعادة تحميل ضمان آخر نسخة
+            p2    = get_player(data2, uid)
+            left2 = TAX_COOLDOWN - (time.time()-p2.get("last_tax",0))
+            if left2>0:
+                await update.message.reply_text("⏳ تم الحصاد للتو تلقائياً!"); return
+            await do_harvest(context.application, uid, p2, data2)
+            save_data(data2)
+        return
 
-        # الدخل الأساسي
-        income    = player["territories"]*50 + 200
-        xp_gained = 50 + player["territories"]*10
-        inv       = player.get("inventory", {})
-        prod_txt  = ""
-        farm_txt  = ""
-
-        # إنتاج المنشآت الصناعية
-        facs = player.get("facilities", {})
-        for res, count in facs.items():
-            if res in RESOURCE_FACILITIES:
-                f   = RESOURCE_FACILITIES[res]
-                qty = f["amount"] * count
-                inv[res] = inv.get(res, 0) + qty
-                prod_txt += f"\n  {f['emoji']} +{qty} {res}"
-
-        # إنتاج المزارع الزراعية
-        crops_inv    = player.get("crops", {})
-        crops_amount = player.get("crops_amount", {})
-        for crop, count in crops_inv.items():
-            if crop in FARM_CROPS:
-                fc  = FARM_CROPS[crop]
-                # استخدم الكمية المحسوبة (مع بونص المنطقة لو موجود)
-                amt_per = crops_amount.get(crop, fc["amount"])
-                qty     = amt_per * count
-                inv[crop] = inv.get(crop, 0) + qty
-                farm_txt += f"\n  {fc['emoji']} +{qty} {crop}"
-
-        data["players"][str(user_id)]["gold"]     += income
-        data["players"][str(user_id)]["last_tax"]  = now
-        data["players"][str(user_id)]["inventory"] = inv
-        leveled_up, new_lvl = add_xp(data, user_id, xp_gained)
+    # ======= بناء بنية تحتية =======
+    if text in ["بناء بنية تحتية","بنية تحتية"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        infra = p.get("infrastructure",0)
+        cost  = 1500 + infra*1000
+        if p["gold"] < cost:
+            await update.message.reply_text(f"❌ محتاج {cost:,}ذ. عندك {p['gold']:,}."); return
+        data["players"][str(uid)]["gold"]           -= cost
+        data["players"][str(uid)]["infrastructure"]  = infra+1
+        leveled_up, new_lvl = add_xp(data, uid, 150)
         save_data(data)
-
-        msg = (
-            f"{box_title('💰', 'تم جمع الموارد!')}\n\n"
-            f"🗺️ أراضي ({player['territories']}): `+{player['territories']*50:,}`\n"
-            f"👑 دخل أساسي:          `+200`\n"
-            f"{sep()}\n"
-            f"💵 الذهب المضاف: *+{income:,}*\n"
-            f"💰 الرصيد الكلي: *{player['gold']+income:,}*\n"
-        )
-        if prod_txt:
-            msg += f"\n🏭 *إنتاج المنشآت:*\n{prod_txt}\n"
-        if farm_txt:
-            msg += f"\n🌾 *إنتاج المزارع:*\n{farm_txt}\n"
-        if not prod_txt and not farm_txt:
-            msg += f"\n💡 ابنِ *منشآت* أو *مزارع* لإنتاج الموارد!"
-        msg += f"\n{sep()}\n⭐ XP: +{xp_gained}  |  ⏳ القادم بعد 15 دقيقة"
-        if leveled_up:
-            msg += f"\n\n🎊 *ترقية مستوى!*\n{new_lvl['emoji']} وصلت لـ *{new_lvl['name']}*!"
+        benefits = {1:"تقدر تبني مصنع صلب",2:"تقدر تبني مصافي نفط/غاز",3:"تقدر تبني بنك مركزي"}
+        msg = (f"🏗️ *البنية التحتية Lv.{infra+1}!*\n{sep()}\n"
+               f"💰 {cost:,}ذ | ✅ {benefits.get(infra+1,'انتاج +1 لكل المنشآت')}\n⭐+150 XP")
+        if leveled_up: msg += f"\n🎊 *ترقية!* {new_lvl['name']} {new_lvl['emoji']}"
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    # ======= السوق =======
-    if text in ["السوق", "سوق", "العروض"]:
-        market = data.get("market", [])
-        if not market:
-            await update.message.reply_text(
-                "🏪 *السوق فاضي.*\n\nلإضافة عرض:\n`عرض [مورد] [الكمية] [السعر]`\nمثال: `عرض نفط 5 750`",
-                parse_mode="Markdown"); return
-        by_resource = {}
-        for o in market:
-            r = o.get("resource", "؟")
-            if r not in by_resource: by_resource[r] = []
-            by_resource[r].append(o)
-
-        msg = f"{box_title('🏪', 'السوق التجاري')}\n\n"
-        for r, offers in by_resource.items():
-            cur_price = get_current_price(data, r)
-            total_qty = sum(o['qty'] for o in offers)
-            trend = "📈" if cur_price > BASE_PRICES.get(r, cur_price) else "📉" if cur_price < BASE_PRICES.get(r, cur_price) else "➡️"
-            msg += f"{trend} *{r}* — {cur_price:,} ذهب/وحدة | متاح: {total_qty}\n"
-            for o in offers[:3]:
-                msg += f"   `{o['id']}` ◂ {o['qty']}وحدة ◂ {o['seller']} ◂ {o['price']:,}ذ\n"
-            msg += "\n"
-        msg += f"{sep()}\n📌 `شراء [كود]` للشراء"
-        await update.message.reply_text(msg, parse_mode="Markdown")
+    # ======= العاصمة =======
+    if text.startswith("العاصمة "):
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        capital = text.replace("العاصمة","").strip()
+        if not capital: await update.message.reply_text("❌ مثال: العاصمة القاهرة"); return
+        data["players"][str(uid)]["capital"] = capital; save_data(data)
+        await update.message.reply_text(f"🏛️ *{capital}* عاصمة *{p['country_name']}* ✅", parse_mode="Markdown")
         return
 
-    # ======= عرض مورد للبيع =======
-    if text.startswith("عرض "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        parts = text.split()
-        if len(parts) != 4:
-            await update.message.reply_text("❌ الصيغة:\n`عرض [مورد] [الكمية] [السعر]`\nمثال: `عرض نفط 5 750`", parse_mode="Markdown"); return
-        resource = parts[1]; qty = parts[2]; price = parts[3]
-        try:
-            qty = int(qty); price = int(price)
-            if qty <= 0 or price <= 0: raise ValueError
-        except:
-            await update.message.reply_text("❌ الكمية والسعر لازم أرقام موجبة."); return
-        inv = player.get("inventory", {})
-        if inv.get(resource, 0) < qty:
-            await update.message.reply_text(f"❌ مخزونك من {resource}: {inv.get(resource,0)} فقط."); return
-        cur_price = get_current_price(data, resource)
-        data["players"][str(user_id)]["inventory"][resource] -= qty
-        if data["players"][str(user_id)]["inventory"][resource] == 0:
-            del data["players"][str(user_id)]["inventory"][resource]
-        offer_id = generate_code()
-        data["market"].append({"id": offer_id, "seller_uid": str(user_id), "seller": player["country_name"],
-                                "resource": resource, "qty": qty, "price": price})
-        save_data(data)
-        await update.message.reply_text(
-            f"🏪 *تم نشر العرض!*\n{sep()}\n"
-            f"📦 المورد: *{qty} {resource}*\n"
-            f"💰 سعرك: {price:,} ذهب\n"
-            f"📊 السعر السوقي: {cur_price:,} ذهب\n"
-            f"{sep()}\n"
-            f"🔑 كود العرض: `{offer_id}`\n"
-            f"📌 شارك الكود مع المشترين!",
-            parse_mode="Markdown")
-        return
-
-    # ======= شراء من السوق =======
-    if text.startswith("شراء "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        offer_id = text.replace("شراء","").strip().upper()
-        market   = data.get("market", [])
-        offer    = next((o for o in market if o["id"] == offer_id), None)
-        if not offer:
-            await update.message.reply_text(f"❌ مش لاقي عرض `{offer_id}`."); return
-        if offer["seller_uid"] == str(user_id):
-            await update.message.reply_text("❌ مينفعش تشتري عرضك!"); return
-        if player["gold"] < offer["price"]:
-            await update.message.reply_text(f"❌ محتاج {offer['price']:,}. عندك {player['gold']:,}."); return
-
-        # حساب وقت الشحن
-        seller_p    = data["players"].get(offer["seller_uid"], {})
-        seller_reg  = seller_p.get("region", "")
-        buyer_reg   = player["region"]
-        ship_time   = calc_ship_time(seller_reg, buyer_reg)
-        blocked, strait_name = is_shipment_blocked(data, seller_reg, buyer_reg)
-        if blocked:
-            ship_time = int(ship_time * 2)  # تأخير ضعف في حالة إغلاق المضيق
-
-        data["players"][str(user_id)]["gold"] -= offer["price"]
-        if offer["seller_uid"] in data["players"]:
-            data["players"][offer["seller_uid"]]["gold"] += offer["price"]
-        data["market"] = [o for o in market if o["id"] != offer_id]
-
-        # إضافة شحنة
-        arrive_at = time.time() + ship_time
-        data["shipments"].append({
-            "buyer_uid": str(user_id), "seller": offer["seller"],
-            "resource": offer["resource"], "qty": offer["qty"],
-            "arrive_at": arrive_at
-        })
-        save_data(data)
-
-        mins = int(ship_time // 60)
-        block_txt = f"\n⚠️ *تأخير بسبب إغلاق مضيق {strait_name}!*" if blocked else ""
-        await update.message.reply_text(
-            f"✅ *تم الشراء بنجاح!*\n{sep()}\n"
-            f"📦 {offer['qty']} {offer['resource']}\n"
-            f"🏪 من: *{offer['seller']}*\n"
-            f"💰 المدفوع: {offer['price']:,} ذهب\n"
-            f"{sep()}\n"
-            f"🚢 *الشحنة في الطريق...*\n"
-            f"⏱️ وصول متوقع: ~{mins} دقيقة"
-            f"{block_txt}",
-            parse_mode="Markdown")
-        try:
-            await context.bot.send_message(chat_id=int(offer["seller_uid"]),
-                text=f"💰 *{player['country_name']}* اشترى {offer['qty']} {offer['resource']}!\nاستلمت {offer['price']:,} ذهب.", parse_mode="Markdown")
-        except: pass
-        return
-
-    # ======= إغلاق/فتح مضيق =======
-    if text.startswith("أغلق مضيق ") or text.startswith("افتح مضيق "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        action      = "أغلق" if text.startswith("أغلق") else "افتح"
-        strait_name = text.replace("أغلق مضيق","").replace("افتح مضيق","").strip()
-        if strait_name not in STRAITS:
-            await update.message.reply_text(f"❌ المضائق المتاحة: {', '.join(STRAITS.keys())}"); return
-        controllers = STRAITS[strait_name]["controller"]
-        if player["region"] not in controllers:
-            await update.message.reply_text(f"❌ دولتك مش متحكمة في مضيق {strait_name}.\nالمتحكمون: {', '.join(controllers)}"); return
-
-        if action == "أغلق":
-            data["straits"][strait_name] = {"blocked": True, "blocked_by": player["country_name"]}
-            save_data(data)
-            await update.message.reply_text(
-                f"🔴 *تم إغلاق مضيق {strait_name}!*\n{sep()}\n"
-                f"🚢 كل الشحنات المارة ستتأخر ضعف الوقت!\n"
-                f"💪 دولتك تتحكم في طريق تجاري مهم!",
-                parse_mode="Markdown")
-        else:
-            data["straits"][strait_name] = {"blocked": False, "blocked_by": None}
-            save_data(data)
-            await update.message.reply_text(
-                f"🟢 *تم فتح مضيق {strait_name}!*\n{sep()}\n"
-                f"🚢 حركة الشحن عادت للطبيعي.",
-                parse_mode="Markdown")
-        return
-
-    # ======= حالة المضائق =======
-    if text in ["المضائق", "حالة المضائق"]:
+    # ======= المضائق =======
+    if text in ["المضائق","حالة المضائق"]:
         straits = get_strait_status(data)
-        msg = f"{box_title('⚓', 'حالة المضائق الاستراتيجية')}\n\n"
+        msg = f"{box_title('⚓','حالة المضائق')}\n\n"
         for name, s in straits.items():
-            if s.get("blocked"):
-                status = f"🔴 *مغلق* — بواسطة {s['blocked_by']}"
-            else:
-                status = "🟢 *مفتوح*"
-            ctrl = ", ".join(s["controller"])
-            affected = ", ".join(s["affects"])
-            msg += (f"🌊 *مضيق {name}*\n"
-                    f"   الحالة: {status}\n"
-                    f"   المتحكم: {ctrl}\n"
-                    f"   المتأثرون: {affected}\n\n")
+            status = f"🔴 *مغلق* — {s['blocked_by']}" if s.get("blocked") else "🟢 *مفتوح*"
+            msg += f"🌊 *{name}*: {status}\n   المتاثرون: {', '.join(s['affects'])}\n\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
+
+    for action in ["اغلق","افتح"]:
+        if text.startswith(f"{action} مضيق "):
+            p = get_player(data, uid)
+            if not p: await update.message.reply_text("❌ مش مسجل."); return
+            sname = text.replace(f"{action} مضيق","").strip()
+            if sname not in STRAITS:
+                await update.message.reply_text(f"❌ المضائق: {', '.join(STRAITS.keys())}"); return
+            if p["region"] not in STRAITS[sname]["controller"]:
+                await update.message.reply_text(f"❌ دولتك مش متحكمة في مضيق {sname}."); return
+            blocked = (action == "اغلق")
+            data["straits"][sname] = {"blocked":blocked, "blocked_by":p["country_name"] if blocked else None}
+            save_data(data)
+            icon = "🔴" if blocked else "🟢"
+            effect = "الشحنات ستتاخر ضعف الوقت!" if blocked else "حركة الشحن طبيعية."
+            await update.message.reply_text(f"{icon} *مضيق {sname} {'مغلق' if blocked else 'مفتوح'}!*\n{effect}", parse_mode="Markdown")
+            return
 
     # ======= تجنيد =======
     if text.startswith("تجنيد "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
         try:
             amount = int(text.replace("تجنيد","").strip())
-            if amount <= 0: raise ValueError
-            cost = amount * 10
-            if player["gold"] < cost:
-                await update.message.reply_text(f"❌ يكلف {cost:,}. عندك {player['gold']:,}."); return
-            data["players"][str(user_id)]["gold"] -= cost
-            data["players"][str(user_id)]["army"] += amount
-            leveled_up, new_lvl = add_xp(data, user_id, amount//10)
+            assert amount > 0
+            cost = amount*10
+            if p["gold"] < cost:
+                await update.message.reply_text(f"❌ يكلف {cost:,}. عندك {p['gold']:,}."); return
+            data["players"][str(uid)]["gold"] -= cost
+            data["players"][str(uid)]["army"] += amount
+            leveled_up, new_lvl = add_xp(data, uid, amount//10)
             save_data(data)
-            msg = (
-                f"⚔️ *تجنيد ناجح!*\n{sep()}\n"
-                f"الجنود المجندون: +{amount:,}\n"
-                f"قوة الجيش الكلية: {player['army']+amount:,}\n"
-                f"الذهب المتبقي: {player['gold']-cost:,}\n"
-                f"⭐ +{amount//10} XP"
-            )
-            if leveled_up: msg += f"\n🎊 *ترقية!* {new_lvl['name']} {new_lvl['emoji']}"
+            msg = (f"⚔️ *تجنيد ناجح!*\n{sep()}\n+{amount:,} جندي\n"
+                   f"الجيش: {p['army']+amount:,} | الذهب: {p['gold']-cost:,}\n⭐+{amount//10}")
+            if leveled_up: msg += f"\n🎊 *ترقية!* {new_lvl['name']}"
             await update.message.reply_text(msg, parse_mode="Markdown")
         except: await update.message.reply_text("❌ مثال: تجنيد 100")
         return
 
     # ======= هجوم =======
     if text.startswith("هجوم على "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        target_name = text.replace("هجوم على","").strip()
-        target_player, target_uid = None, None
-        for uid, p in data["players"].items():
-            if p["country_name"] == target_name or p["region"] == target_name:
-                target_player, target_uid = p, uid; break
-        if not target_player:
-            await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
-        if target_uid == str(user_id):
-            await update.message.reply_text("❌ مينفعش تهاجم نفسك!"); return
-        if target_player["country_name"] in player.get("allies", []):
-            await update.message.reply_text(f"❌ {target_player['country_name']} حليفك!"); return
-        att  = player["army"] * random.uniform(0.7, 1.3)
-        deff = target_player["army"] * random.uniform(0.7, 1.3)
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        # هل الحروب مفتوحة؟
+        if not data.get("wars_enabled", True):
+            await update.message.reply_text(
+                f"🕊️ *الحروب موقوفة حالياً*\n{sep()}\n"
+                f"الأدمن أوقف الحروب مؤقتاً. انتظر إعادة الفتح.", parse_mode="Markdown"); return
+        # cooldown الهجوم
+        last_atk = p.get("last_attack",0)
+        if time.time()-last_atk < ATTACK_CD:
+            rem = int(ATTACK_CD-(time.time()-last_atk))
+            await update.message.reply_text(f"⏳ استنى {rem//60}:{rem%60:02d} قبل الهجوم التالي!"); return
+        tname = text.replace("هجوم على","").strip()
+        tuid, tp = find_by_name(data, tname)
+        if not tp: await update.message.reply_text(f"❌ مش لاقي '{tname}'."); return
+        if tuid == str(uid): await update.message.reply_text("❌ مينفعش تهاجم نفسك!"); return
+        if tp["country_name"] in p.get("allies",[]): await update.message.reply_text(f"❌ {tp['country_name']} حليفك!"); return
+        att  = p["army"]*random.uniform(0.7,1.3)
+        deff = tp["army"]*random.uniform(0.7,1.3)
+        data["players"][str(uid)]["last_attack"] = time.time()
         if att > deff:
-            loot = min(target_player["gold"]//3, 500)
-            la, ld = random.randint(10,50), random.randint(50,150)
-            data["players"][str(user_id)]["gold"]        += loot
-            data["players"][str(user_id)]["territories"] += 1
-            data["players"][str(user_id)]["army"]         = max(0, player["army"]-la)
-            data["players"][target_uid]["gold"]           -= loot
-            data["players"][target_uid]["territories"]    = max(1, target_player["territories"]-1)
-            data["players"][target_uid]["army"]           = max(0, target_player["army"]-ld)
-            leveled_up, new_lvl = add_xp(data, user_id, 200)
+            loot = min(tp["gold"]//3, 1000)
+            la,ld = random.randint(10,50), random.randint(50,150)
+            # نقل الدولة للمنتصر لو جيش المهزوم وصل صفر
+            loser_army_after = max(0, tp["army"]-ld)
+            conquered = loser_army_after == 0 and tp["army"] < p["army"] // 2
+
+            data["players"][str(uid)]["gold"]        += loot
+            data["players"][str(uid)]["territories"] += 1
+            data["players"][str(uid)]["army"]         = max(0, p["army"]-la)
+            data["players"][tuid]["gold"]             = max(0, tp["gold"]-loot)
+            data["players"][tuid]["territories"]      = max(1, tp["territories"]-1)
+            data["players"][tuid]["army"]             = loser_army_after
+            data["players"][tuid]["wars_lost"]        = tp.get("wars_lost",0)+1
+            leveled_up, new_lvl = add_xp(data, uid, 200)
+
+            conquest_txt = ""
+            if conquered:
+                # نقل علم المهزوم للمنتصر
+                loser_flag = os.path.join(FLAGS_DIR, f"{tp['region']}.png")
+                winner_flag = os.path.join(FLAGS_DIR, f"{p['region']}.png")
+                if os.path.exists(winner_flag):
+                    try:
+                        import shutil
+                        shutil.copy2(winner_flag, loser_flag)
+                    except: pass
+                # نقل الدولة — غيّر الـ owner
+                data["players"][tuid]["country_name"] = f"{tp['country_name']} (محتلة)"
+                data["players"][tuid]["occupied_by"]  = p["country_name"]
+                data["players"][str(uid)]["territories"] += tp["territories"]
+                data["players"][tuid]["territories"]  = 0
+                conquest_txt = f"\n🏳️ *احتللت {tp['country_name']} بالكامل!*\nعلمك يرفرف على أراضيهم!"
+
             save_data(data)
-            msg = (
-                f"⚔️ *نتيجة المعركة*\n"
-                f"{sep('═')}\n"
-                f"🏆 *انتصار!*\n\n"
-                f"🗡️ المهاجم: *{player['country_name']}*\n"
-                f"🛡️ المدافع: *{target_player['country_name']}*\n"
-                f"{sep()}\n"
-                f"💰 الغنيمة: +{loot:,} ذهب\n"
-                f"🗺️ أرض جديدة ضُمّت!\n"
-                f"{sep()}\n"
-                f"💀 خسائرك: {la} جندي\n"
-                f"💀 خسائر العدو: {ld} جندي\n"
-                f"{sep()}\n"
-                f"⭐ +200 XP"
-            )
-            if leveled_up: msg += f"\n🎊 *ترقية!* {new_lvl['name']} {new_lvl['emoji']}"
+            msg = (f"⚔️ *نتيجة المعركة*\n{sep('═')}\n🏆 *انتصار!*\n\n"
+                   f"🗡️ {p['country_name']} vs 🛡️ {tp['country_name']}\n{sep()}\n"
+                   f"💰 +{loot:,}ذ | 🗺️ أرض جديدة!\n"
+                   f"💀 خسائرك: {la} | خسائر العدو: {ld}\n{sep()}\n⭐+200 XP"
+                   f"{conquest_txt}")
+            if leveled_up: msg += f"\n🎊 {new_lvl['name']} {new_lvl['emoji']}"
             await update.message.reply_text(msg, parse_mode="Markdown")
-            try: await context.bot.send_message(chat_id=int(target_uid),
-                text=f"🚨 *تنبيه حرب!*\n{sep()}\n"
-                     f"*{player['country_name']}* شنّ هجوماً على دولتك!\n\n"
-                     f"💸 خسرت: {loot:,} ذهب\n"
-                     f"💀 خسائر جيشك: {ld} جندي\n"
-                     f"🗺️ خسرت أرضاً!\n{sep()}\n"
-                     f"⚔️ ردّ الهجوم بـ `هجوم على {player['country_name']}`", parse_mode="Markdown")
+            try:
+                defeat_msg = (f"🚨 *تنبيه حرب!*\n{sep()}\n*{p['country_name']}* هاجمك!\n"
+                              f"💸 خسرت {loot:,}ذ | 💀 خسائر: {ld}\n"
+                              f"⚔️ رد بـ `هجوم على {p['country_name']}`")
+                if conquered:
+                    defeat_msg += f"\n\n💔 *دولتك محتلة بالكامل!*\nأعد بناء جيشك واسترد أراضيك!"
+                await context.bot.send_message(chat_id=int(tuid), text=defeat_msg, parse_mode="Markdown")
             except: pass
         else:
-            la, ld = random.randint(50,200), random.randint(10,50)
-            data["players"][str(user_id)]["army"]      = max(0, player["army"]-la)
-            data["players"][str(user_id)]["wars_lost"]  = player.get("wars_lost",0) + 1
-            data["players"][target_uid]["army"]          = max(0, target_player["army"]-ld)
+            la,ld = random.randint(50,200), random.randint(10,50)
+            # تحقق: لو الجيش 0 لا تبعت خسارة 0
+            if p["army"] == 0:
+                await update.message.reply_text("❌ جيشك 0! جند جنوداً أولاً."); return
+            data["players"][str(uid)]["army"]      = max(0, p["army"]-la)
+            data["players"][str(uid)]["wars_lost"] = p.get("wars_lost",0)+1
+            data["players"][tuid]["army"]          = max(0, tp["army"]-ld)
             save_data(data)
             await update.message.reply_text(
-                f"⚔️ *نتيجة المعركة*\n"
-                f"{sep('═')}\n"
-                f"❌ *هزيمة!*\n\n"
-                f"🗡️ المهاجم: *{player['country_name']}*\n"
-                f"🛡️ المدافع: *{target_player['country_name']}*\n"
-                f"{sep()}\n"
-                f"💀 خسائرك: {la} جندي\n"
-                f"💀 خسائر العدو: {ld} جندي\n"
-                f"{sep()}\n"
-                f"💡 جنّد المزيد وأعد الكرة!",
+                f"⚔️ *نتيجة المعركة*\n{sep('═')}\n❌ *هزيمة!*\n\n"
+                f"💀 خسائرك: {la} | خسائر العدو: {ld}\n💡 جنّد أكثر وأعد المحاولة!",
                 parse_mode="Markdown")
         return
 
-    # ======= عرض تحالف =======
-    if text.startswith("تحالف مع "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        target_name = text.replace("تحالف مع","").strip()
-        for uid, p in data["players"].items():
-            if p["country_name"] == target_name or p["region"] == target_name:
-                if p["country_name"] in player.get("allies",[]): 
-                    await update.message.reply_text("✅ دي دولة حليفة بالفعل."); return
-                if uid == str(user_id):
-                    await update.message.reply_text("❌ مينفعش تتحالف مع نفسك!"); return
-                # تخزين طلب التحالف
-                if "alliance_requests" not in data: data["alliance_requests"] = {}
-                req_key = f"{user_id}_{uid}"
-                data["alliance_requests"][req_key] = {
-                    "from_uid": str(user_id), "from_name": player["country_name"],
-                    "to_uid": uid, "to_name": p["country_name"],
-                    "time": time.time()
-                }
-                save_data(data)
-                await update.message.reply_text(
-                    f"📨 *تم إرسال عرض التحالف!*\n{sep()}\n"
-                    f"إلى: *{p['country_name']}*\n"
-                    f"⏳ في انتظار الموافقة...", parse_mode="Markdown")
-                try:
-                    kbd = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ قبول", callback_data=f"ally_accept_{req_key}"),
-                        InlineKeyboardButton("❌ رفض",  callback_data=f"ally_reject_{req_key}"),
-                    ]])
-                    await context.bot.send_message(chat_id=int(uid),
-                        text=f"🤝 *عرض تحالف جديد!*\n{sep()}\n"
-                             f"*{player['country_name']}* يعرض التحالف معك!\n\n"
-                             f"هل توافق؟",
-                        reply_markup=kbd, parse_mode="Markdown")
-                except: pass
-                return
-        await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
-
-    # ======= حل الحلف (بالاتفاق) =======
-    if text.startswith("حل الحلف مع ") or text.startswith("حل حلف مع "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        target_name = text.replace("حل الحلف مع","").replace("حل حلف مع","").strip()
-        for uid, p in data["players"].items():
-            if p["country_name"] == target_name or p["region"] == target_name:
-                if p["country_name"] not in player.get("allies",[]):
-                    await update.message.reply_text(f"❌ {target_name} مش حليفك أصلاً."); return
-                # لازم موافقة الطرفين — ابعت طلب
-                if "dissolve_requests" not in data: data["dissolve_requests"] = {}
-                req_key = f"{user_id}_{uid}_dissolve"
-                data["dissolve_requests"][req_key] = {
-                    "from_uid": str(user_id), "from_name": player["country_name"],
-                    "to_uid": uid, "to_name": p["country_name"]
-                }
-                save_data(data)
-                await update.message.reply_text(
-                    f"📨 *تم إرسال طلب حل الحلف!*\n{sep()}\n"
-                    f"إلى: *{p['country_name']}*\n"
-                    f"⏳ في انتظار موافقتهم...", parse_mode="Markdown")
-                try:
-                    kbd = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ موافق", callback_data=f"dissolve_accept_{req_key}"),
-                        InlineKeyboardButton("❌ رفض",   callback_data=f"dissolve_reject_{req_key}"),
-                    ]])
-                    await context.bot.send_message(chat_id=int(uid),
-                        text=f"⚠️ *طلب حل الحلف!*\n{sep()}\n"
-                             f"*{player['country_name']}* يطلب حل الحلف معك بالتراضي.\n"
-                             f"هل توافق؟",
-                        reply_markup=kbd, parse_mode="Markdown")
-                except: pass
-                return
-        await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
-
-    # ======= نقض الحلف (بدون موافقة = عقوبات) =======
-    if text.startswith("نقض الحلف مع ") or text.startswith("نقض حلف مع "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        target_name = text.replace("نقض الحلف مع","").replace("نقض حلف مع","").strip()
-        for uid, p in data["players"].items():
-            if p["country_name"] == target_name or p["region"] == target_name:
-                if p["country_name"] not in player.get("allies",[]):
-                    await update.message.reply_text(f"❌ {target_name} مش حليفك."); return
-                # إزالة التحالف
-                data["players"][str(user_id)]["allies"] = [
-                    a for a in player["allies"] if a != p["country_name"]]
-                data["players"][uid]["allies"] = [
-                    a for a in p.get("allies",[]) if a != player["country_name"]]
-                # عقوبات الخيانة
-                penalty = min(player["gold"] // 4, 1000)
-                data["players"][str(user_id)]["gold"] = max(0, player["gold"] - penalty)
-                data["players"][str(user_id)]["traitor"] = True   # وصمة الخائن
-                save_data(data)
-                await update.message.reply_text(
-                    f"🗡️ *نقضت الحلف مع {p['country_name']}!*\n{sep()}\n"
-                    f"⚠️ *عقوبات الخيانة:*\n"
-                    f"   💸 خسرت: {penalty:,} ذهب\n"
-                    f"   🗡️ لقب *خائن* أُضيف لاسم دولتك\n"
-                    f"   📉 انخفاض في الرضا الاجتماعي\n"
-                    f"{sep()}\n"
-                    f"💡 لإزالة لقب الخائن: `إزالة الخيانة`", parse_mode="Markdown")
-                try:
-                    await context.bot.send_message(chat_id=int(uid),
-                        text=f"🚨 *خيانة!*\n{sep()}\n"
-                             f"*{player['country_name']}* 🗡️خائن نقض الحلف معك!\n"
-                             f"أنت حر الآن في مهاجمتهم ⚔️",
-                        parse_mode="Markdown")
-                except: pass
-                return
-        await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
-
-    # ======= إزالة لقب الخائن (بذهب) =======
-    if text in ["إزالة الخيانة", "ازالة الخيانة", "تنظيف السمعة"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        if not player.get("traitor"):
-            await update.message.reply_text("✅ دولتك نظيفة ومفيش لقب خيانة."); return
-        cost = 2000
-        if player["gold"] < cost:
+    # ======= طلبات التحالف الواردة =======
+    if text in ["طلبات التحالف", "طلبات الحلف", "عروض التحالف"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        reqs = [r for r in data.get("alliance_requests",{}).values()
+                if r["to_uid"] == str(uid)]
+        dissolve = [r for r in data.get("dissolve_requests",{}).values()
+                    if r["to_uid"] == str(uid)]
+        if not reqs and not dissolve:
             await update.message.reply_text(
-                f"❌ محتاج {cost:,} ذهب لإزالة لقب الخيانة.\nعندك {player['gold']:,}."); return
-        data["players"][str(user_id)]["gold"] -= cost
-        data["players"][str(user_id)]["traitor"] = False
+                f"{box_title('📨','الطلبات الواردة')}\n\nمفيش طلبات حالياً.", parse_mode="Markdown"); return
+        msg = f"{box_title('📨','الطلبات الواردة')}\n\n"
+        if reqs:
+            msg += "🤝 *عروض تحالف:*\n"
+            for r in reqs:
+                msg += f"   • *{r['from_name']}* — رد بـ `تحالف مع {r['from_name']}`\n"
+            msg += "\n"
+        if dissolve:
+            msg += "⚠️ *طلبات حل حلف:*\n"
+            for r in dissolve:
+                msg += f"   • *{r['from_name']}* يطلب حل الحلف\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # ======= البنك الدولي - القروض =======
+    if text in ["البنك الدولي","بنك","قرض","اخد قرض"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        active = p.get("loans",[])
+        if len(active) >= 2:
+            await update.message.reply_text(
+                f"❌ *عندك {len(active)} قروض نشطة*\n{sep()}\n"
+                f"لازم تسدد القروض الحالية قبل قرض جديد.",
+                parse_mode="Markdown"); return
+        rows = []
+        for l in LOAN_OPTIONS:
+            total = int(l["amount"]*(1+l["interest"]))
+            rows.append([InlineKeyboardButton(
+                f"{l['emoji']} {l['name']}: {l['amount']:,}ذ → يُسدَّد {total:,}ذ في {l['due_cycles']} دورات",
+                callback_data=f"loan_{l['id']}")])
+        rows.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+        loans_txt = ""
+        for loan in active:
+            loans_txt += f"  • {loan['name']}: يُسدَّد بعد {loan['remaining_cycles']} دورات\n"
+        msg = (
+            f"{box_title('🏦','البنك الدولي')}\n\n"
+            f"اقترض الآن وسدّد تلقائياً من الحصاد!\n"
+            f"⚠️ عدم السداد = عقوبة 50% إضافية\n"
+        )
+        if loans_txt:
+            msg += f"\n📋 *قروضك الحالية:*\n{loans_txt}"
+        msg += f"\n{sep()}\n*اختار نوع القرض:*"
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+        return
+
+    # ======= تحالف مع =======
+    if text.startswith("تحالف مع "):
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        tname = text.replace("تحالف مع","").strip()
+        tuid, tp = find_by_name(data, tname)
+        if not tp: await update.message.reply_text(f"❌ مش لاقي '{tname}'."); return
+        if tuid == str(uid): await update.message.reply_text("❌ مينفعش تتحالف مع نفسك!"); return
+        if tp["country_name"] in p.get("allies",[]): await update.message.reply_text("✅ حليف بالفعل."); return
+        # حفظ الطلب
+        req_key = f"{uid}_{tuid}"
+        data.setdefault("alliance_requests",{})[req_key] = {
+            "from_uid":str(uid),"from_name":p["country_name"],
+            "to_uid":tuid,"to_name":tp["country_name"],"time":time.time()
+        }
         save_data(data)
         await update.message.reply_text(
-            f"✅ *تم تنظيف سمعة دولتك!*\n{sep()}\n"
-            f"💸 دفعت: {cost:,} ذهب\n"
-            f"🗡️ لقب الخائن أُزيل!", parse_mode="Markdown")
+            f"📨 *تم ارسال عرض التحالف!*\n{sep()}\nالى: *{tp['country_name']}*\n⏳ في انتظار الموافقة...",
+            parse_mode="Markdown")
+        try:
+            kbd = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ قبول", callback_data=f"ally_accept_{req_key}"),
+                InlineKeyboardButton("❌ رفض",  callback_data=f"ally_reject_{req_key}"),
+            ]])
+            await context.bot.send_message(chat_id=int(tuid),
+                text=f"🤝 *عرض تحالف!*\n{sep()}\n*{p['country_name']}* يعرض التحالف معك!\nهل توافق؟",
+                reply_markup=kbd, parse_mode="Markdown")
+        except: pass
+        return
+
+    # ======= حل الحلف بالتراضي =======
+    if text.startswith("حل الحلف مع ") or text.startswith("حل حلف مع "):
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        tname = text.replace("حل الحلف مع","").replace("حل حلف مع","").strip()
+        tuid, tp = find_by_name(data, tname)
+        if not tp: await update.message.reply_text(f"❌ مش لاقي '{tname}'."); return
+        if tp["country_name"] not in p.get("allies",[]): await update.message.reply_text("❌ مش حليفك."); return
+        req_key = f"{uid}_{tuid}_dissolve"
+        data.setdefault("dissolve_requests",{})[req_key] = {
+            "from_uid":str(uid),"from_name":p["country_name"],
+            "to_uid":tuid,"to_name":tp["country_name"]
+        }
+        save_data(data)
+        await update.message.reply_text(f"📨 تم ارسال طلب حل الحلف الى *{tp['country_name']}*...", parse_mode="Markdown")
+        try:
+            kbd = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ موافق", callback_data=f"dissolve_accept_{req_key}"),
+                InlineKeyboardButton("❌ رفض",   callback_data=f"dissolve_reject_{req_key}"),
+            ]])
+            await context.bot.send_message(chat_id=int(tuid),
+                text=f"⚠️ *طلب حل الحلف!*\n{sep()}\n*{p['country_name']}* يريد حل الحلف بالتراضي.\nهل توافق؟",
+                reply_markup=kbd, parse_mode="Markdown")
+        except: pass
+        return
+
+    # ======= نقض الحلف =======
+    if text.startswith("نقض الحلف مع ") or text.startswith("نقض حلف مع "):
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        tname = text.replace("نقض الحلف مع","").replace("نقض حلف مع","").strip()
+        tuid, tp = find_by_name(data, tname)
+        if not tp: await update.message.reply_text(f"❌ مش لاقي '{tname}'."); return
+        if tp["country_name"] not in p.get("allies",[]): await update.message.reply_text("❌ مش حليفك."); return
+        data["players"][str(uid)]["allies"] = [a for a in p["allies"] if a!=tp["country_name"]]
+        data["players"][tuid]["allies"]     = [a for a in tp.get("allies",[]) if a!=p["country_name"]]
+        penalty = min(p["gold"]//4, 1000)
+        data["players"][str(uid)]["gold"]    = max(0, p["gold"]-penalty)
+        data["players"][str(uid)]["traitor"] = True
+        save_data(data)
+        await update.message.reply_text(
+            f"🗡️ *نقضت الحلف!*\n{sep()}\n💸 عقوبة: {penalty:,}ذ\n🗡️ لقب *خائن* اضيف لدولتك\n💡 `ازالة الخيانة` = 2000ذ",
+            parse_mode="Markdown")
+        try:
+            await context.bot.send_message(chat_id=int(tuid),
+                text=f"🚨 *خيانة!*\n{sep()}\n*{p['country_name']}* 🗡️خائن نقض الحلف معك!\nحر في مهاجمتهم ⚔️", parse_mode="Markdown")
+        except: pass
+        return
+
+    # ======= ازالة الخيانة =======
+    if text in ["ازالة الخيانة","تنظيف السمعة"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        if not p.get("traitor"): await update.message.reply_text("✅ دولتك نظيفة."); return
+        if p["gold"]<2000: await update.message.reply_text(f"❌ محتاج 2,000ذ. عندك {p['gold']:,}."); return
+        data["players"][str(uid)]["gold"]   -= 2000
+        data["players"][str(uid)]["traitor"] = False
+        save_data(data)
+        await update.message.reply_text(f"✅ *تم تنظيف سمعة دولتك!*\n💸 2,000ذ\n🗡️ لقب الخائن ازيل!", parse_mode="Markdown")
         return
 
     # ======= تحويل ذهب =======
     if text.startswith("تحويل "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
         parts = text.split()
-        if len(parts) != 3:
-            await update.message.reply_text("❌ الصيغة:\n`تحويل [المبلغ] [كود اللاعب]`", parse_mode="Markdown"); return
-        try: amount = int(parts[1]); assert amount > 0
+        if len(parts)!=3: await update.message.reply_text("❌ الصيغة: تحويل [مبلغ] [كود]", parse_mode="Markdown"); return
+        try: amount=int(parts[1]); assert amount>0
         except: await update.message.reply_text("❌ المبلغ لازم رقم موجب."); return
-        if player["gold"] < amount:
-            await update.message.reply_text(f"❌ عندك {player['gold']:,} بس."); return
-        target_uid, target_player = find_player_by_code(data, parts[2])
-        if not target_player:
-            await update.message.reply_text(f"❌ مش لاقي لاعب."); return
-        if target_uid == str(user_id):
-            await update.message.reply_text("❌ مينفعش تحول لنفسك!"); return
-        data["players"][str(user_id)]["gold"] -= amount
-        data["players"][target_uid]["gold"]   += amount; save_data(data)
+        if p["gold"]<amount: await update.message.reply_text(f"❌ عندك {p['gold']:,} بس."); return
+        tuid, tp = find_by_code(data, parts[2])
+        if not tp: await update.message.reply_text("❌ مش لاقي لاعب."); return
+        if tuid==str(uid): await update.message.reply_text("❌ مينفعش تحول لنفسك!"); return
+        data["players"][str(uid)]["gold"] -= amount
+        data["players"][tuid]["gold"]     += amount
+        save_data(data)
         await update.message.reply_text(
-            f"💸 *تحويل ناجح!*\n{sep()}\n"
-            f"إلى: *{target_player['country_name']}*\n"
-            f"المبلغ: *{amount:,}* ذهب\n"
-            f"رصيدك الآن: {player['gold']-amount:,} ذهب",
+            f"💸 *تحويل ناجح!*\n{sep()}\nالى: *{tp['country_name']}*\n{amount:,}ذ\nرصيدك: {p['gold']-amount:,}",
             parse_mode="Markdown")
-        try: await context.bot.send_message(chat_id=int(target_uid),
-            text=f"💰 *تحويل وارد!*\n{sep()}\n"
-                 f"من: *{player['country_name']}*\n"
-                 f"المبلغ: *{amount:,}* ذهب\n"
-                 f"رصيدك الآن: {target_player['gold']+amount:,} ذهب",
-            parse_mode="Markdown")
+        try:
+            await context.bot.send_message(chat_id=int(tuid),
+                text=f"💰 *تحويل وارد!*\n{sep()}\nمن: *{p['country_name']}*\n+{amount:,}ذ", parse_mode="Markdown")
         except: pass
         return
 
     # ======= المتصدرين =======
-    if text in ["المتصدرين", "الترتيب"]:
-        if not data["players"]:
-            await update.message.reply_text("🏆 لا يوجد لاعبين بعد."); return
-        sorted_p = sorted(data["players"].items(), key=lambda x: x[1].get("xp",0), reverse=True)
-        msg = f"{box_title('🏆', 'لوحة المتصدرين')}\n\n"
+    if text in ["المتصدرين","الترتيب"]:
+        if not data["players"]: await update.message.reply_text("لا يوجد لاعبين."); return
+        sorted_p = sorted(data["players"].items(), key=lambda x:x[1].get("xp",0), reverse=True)
+        msg = f"{box_title('🏆','المتصدرين')}\n\n"
         medals = ["🥇","🥈","🥉"]
-        for i, (uid, p) in enumerate(sorted_p[:10]):
-            medal = medals[i] if i < 3 else f"  {i+1}."
-            lvl   = get_level(p.get("xp",0))
-            bar   = progress_bar(p.get("xp",0), 25000, 8)
-            msg  += f"{medal} {lvl['emoji']} *{p['country_name']}*\n"
-            msg  += f"      Lv.{lvl['level']} {lvl['name']} | {p.get('xp',0):,} XP\n"
-            msg  += f"      `{bar}`\n\n"
+        for i,(puid,pp) in enumerate(sorted_p[:10]):
+            m   = medals[i] if i<3 else f"  {i+1}."
+            lvl = get_level(pp.get("xp",0))
+            bar_xp = progress_bar(pp.get("xp",0), 25000, 8)
+            tag = " 🗡️" if pp.get("traitor") else ""
+            msg += f"{m} {lvl['emoji']} *{pp['country_name']}*{tag}\n      Lv.{lvl['level']} | {pp.get('xp',0):,} XP | `{bar_xp}`\n\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
     # ======= قائمة الدول =======
-    if text in ["قائمة الدول", "الدول"]:
-        if not data["players"]:
-            await update.message.reply_text("🗺️ لا يوجد دول."); return
-        msg = f"{box_title('🗺️', 'الدول في اللعبة')} ({len(data['players'])} دولة)\n\n"
-        for i, (uid, p) in enumerate(sorted(data["players"].items(), key=lambda x: x[1].get("xp",0), reverse=True), 1):
-            lvl = get_level(p.get("xp",0))
-            cap = p.get("capital","؟")
-            msg += (f"{i}. {lvl['emoji']} *{p['country_name']}* — {p['region']}\n"
-                    f"    🏅 Lv.{lvl['level']} | 💰 {p['gold']:,} | ⚔️ {p['army']:,} | 🗺️ {p['territories']}\n\n")
+    if text in ["قائمة الدول","الدول"]:
+        if not data["players"]: await update.message.reply_text("لا يوجد دول."); return
+        msg = f"{box_title('🗺️','الدول')} ({len(data['players'])} دولة)\n\n"
+        for i,(puid,pp) in enumerate(sorted(data["players"].items(),key=lambda x:x[1].get("xp",0),reverse=True),1):
+            lvl = get_level(pp.get("xp",0))
+            tag = " 🗡️" if pp.get("traitor") else ""
+            msg += f"{i}. {lvl['emoji']} *{pp['country_name']}*{tag} — {pp['region']}\n    💰{pp['gold']:,} | ⚔️{pp['army']:,} | 🗺️{pp['territories']}\n\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
     # ======= خريطة =======
-    if text in ["خريطة", "الخريطة"]:
-        if not data["players"]:
-            await update.message.reply_text("🗺️ لا يوجد دول."); return
+    if text in ["خريطة","الخريطة"]:
+        if not data["players"]: await update.message.reply_text("لا يوجد دول."); return
         await update.message.reply_text("🗺️ جاري التوليد...")
         try:
             buf = generate_map(data["players"], data)
-            cap = "🗺️ *خريطة الشرق الأوسط*\n\n"
-            for p in data["players"].values():
-                lvl = get_level(p.get("xp",0))
-                cap += f"{lvl['emoji']} *{p['country_name']}* ← {p['region']}\n"
+            cap = "🗺️ *خريطة الشرق الاوسط*\n"
+            for pp in data["players"].values():
+                lvl = get_level(pp.get("xp",0))
+                cap += f"{lvl['emoji']} *{pp['country_name']}* ← {pp['region']}\n"
             await update.message.reply_photo(photo=buf, caption=cap, parse_mode="Markdown")
-        except Exception as e: await update.message.reply_text(f"❌ خطأ: {e}")
+        except Exception as e: await update.message.reply_text(f"❌ خطا: {e}")
         return
 
-    # ======= تحديد العاصمة =======
-    if text.startswith("العاصمة "):
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        capital = text.replace("العاصمة", "").strip()
-        if not capital:
-            await update.message.reply_text("❌ اكتب اسم العاصمة.\nمثال: `العاصمة القاهرة`", parse_mode="Markdown"); return
-        data["players"][str(user_id)]["capital"] = capital
-        save_data(data)
+    # ======= مساعدة =======
+    if text in ["مساعدة","اوامر","help"]:
         await update.message.reply_text(
-            f"🏛️ *تم تحديد العاصمة!*\n{sep()}\n"
-            f"دولة: *{player['country_name']}*\n"
-            f"العاصمة: 🏙️ *{capital}*\n\n"
-            f"ستظهر في بطاقة دولتك!",
+            f"{box_title('📖','اوامر اللعبة')}\n\n"
+            f"🔹 *انضمام:*\n`انشاء دولة` | `كودي`\n\n"
+            f"🔹 *معلومات:*\n`حالة دولتي` | `قائمة الدول` | `خريطة` | `المتصدرين` | `المضائق`\n\n"
+            f"🔹 *اقتصاد:*\n`بناء مزرعة` | `بناء منشاة` | `بناء بنية تحتية`\n"
+            f"`العاصمة [اسم]` | `تحويل [مبلغ] [كود]`\n"
+            f"`البنك الدولي` — اقترض ذهب وسدّد من الحصاد\n"
+            f"💡 الحصاد تلقائي كل 15 دقيقة\n\n"
+            f"🔹 *جيش:*\n`تجنيد [عدد]` | `هجوم على [اسم]`\n\n"
+            f"🔹 *دبلوماسية:*\n`تحالف مع [اسم]` — بيبعت طلب للقبول\n"
+            f"`حل الحلف مع [اسم]` — بالتراضي\n"
+            f"`نقض الحلف مع [اسم]` — بعقوبات 🗡️\n"
+            f"`ازالة الخيانة` — 2000ذ\n\n"
+            f"🔹 *المضائق:*\n`اغلق/افتح مضيق [اسم]`\nالاسماء: هرمز | باب المندب | السويس\n\n"
+            f"{'⚔️ الحروب: مفتوحة' if data.get('wars_enabled',True) else '🕊️ الحروب: موقوفة'}",
             parse_mode="Markdown")
         return
 
-    # ======= بناء بنية تحتية =======
-    if text in ["بناء بنية تحتية", "بنية تحتية", "انشئ بنية تحتية"]:
-        player = get_player(data, user_id)
-        if not player:
-            await update.message.reply_text("❌ مش مسجل."); return
-        region = player["region"]
-        infra  = player.get("infrastructure", 0)
-        # تكلفة البنية التحتية متصاعدة
-        cost   = 1500 + (infra * 1000)
-        if player["gold"] < cost:
-            await update.message.reply_text(
-                f"❌ محتاج {cost:,} ذهب لبناء البنية التحتية (المستوى {infra+1}).\n"
-                f"عندك {player['gold']:,} ذهب.", parse_mode="Markdown"); return
-
-        data["players"][str(user_id)]["gold"]          -= cost
-        data["players"][str(user_id)]["infrastructure"]  = infra + 1
-        leveled_up, new_lvl = add_xp(data, user_id, 150)
-        save_data(data)
-
-        # مزايا البنية التحتية
-        benefits = {
-            1: "تقدر تبني منشآت صناعية بسيطة (مصنع صلب)",
-            2: "تقدر تبني مصافي نفط وغاز (لو اشتريتهم)",
-            3: "تقدر تبني بنك مركزي — إنتاج كل منشأة +1",
-        }
-        benefit_txt = benefits.get(infra+1, "إنتاج كل منشآتك +1 إضافي")
-        msg = (
-            f"🏗️ *البنية التحتية — المستوى {infra+1}!*\n{sep()}\n"
-            f"💰 التكلفة: {cost:,} ذهب\n"
-            f"✅ مفتوح جديد:\n   {benefit_txt}\n"
-            f"{sep()}\n"
-            f"⭐ +150 XP"
-        )
-        if leveled_up: msg += f"\n🎊 *ترقية مستوى!* {new_lvl['name']} {new_lvl['emoji']}"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    # ======= مساعدة (رسالتين عشان ما تتقطعش) =======
-    if text in ["مساعدة", "اوامر", "help"]:
-        await update.message.reply_text(
-            "📖 *أوامر اللعبة — الجزء الأول:*\n\n"
-            "🔹 *انضمام:*\n"
-            "• `انشاء دولة`\n"
-            "• `كودي`\n\n"
-            "🔹 *معلومات:*\n"
-            "• `حالة دولتي`\n"
-            "• `قائمة الدول`\n"
-            "• `خريطة`\n"
-            "• `المتصدرين`\n"
-            "• `المضائق`\n\n"
-            "🔹 *اقتصاد:*\n"
-            "• `جمع الضرائب` — كل 15 دقيقة\n"
-            "• `بناء مزرعة` — اختار المحصول\n"
-            "• `بناء منشأة` — صناعي\n"
-            "• `بناء بنية تحتية` — يفتح صناعات جديدة\n"
-            "• `العاصمة [اسم]` — حدد عاصمتك\n"
-            "• `تحويل [مبلغ] [كود]`\n"
-            "• `اهدي أرض [كود]`",
-            parse_mode="Markdown")
-        await update.message.reply_text(
-            "📖 *أوامر اللعبة — الجزء الثاني:*\n\n"
-            "🔹 *جيش:*\n"
-            "• `تجنيد [عدد]`\n"
-            "• `هجوم على [اسم الدولة]`\n\n"
-            "🔹 *دبلوماسية:*\n"
-            "• `تحالف مع [اسم الدولة]`\n\n"
-            "🔹 *السوق:*\n"
-            "• `السوق` — عرض الأسعار\n"
-            "• `عرض [مورد] [كمية] [سعر]`\n"
-            "• `شراء [كود العرض]`\n\n"
-            "🔹 *المضائق:*\n"
-            "• `أغلق مضيق هرمز`\n"
-            "• `افتح مضيق هرمز`\n"
-            "• `أغلق مضيق باب المندب`\n"
-            "• `افتح مضيق باب المندب`",
-            parse_mode="Markdown")
-        return
-
-    # ======= أوامر الأدمن =======
-    if is_admin(user_id):
+    # ======= اوامر الادمن =======
+    if is_admin(uid):
+        # انشاء دولة نصي (بدون علم)
         if text.startswith("دولة "):
             parts = text.split()
-            if len(parts) < 4:
-                await update.message.reply_text("❌ الصيغة:\n`دولة [المنطقة] [اسم] [الكود]`", parse_mode="Markdown"); return
-            code = parts[-1].upper(); region = parts[1]; country_name = " ".join(parts[2:-1])
-            if code not in data["pending_codes"]:
-                await update.message.reply_text(f"❌ الكود `{code}` مش موجود.", parse_mode="Markdown"); return
-            if region not in AVAILABLE_REGIONS:
-                await update.message.reply_text(f"⚠️ '{region}' مش في القائمة."); return
-            for uid, p in data["players"].items():
-                if p["region"] == region:
-                    await update.message.reply_text(f"❌ '{region}' محجوزة."); return
-            player_id = data["pending_codes"].pop(code); player_code = generate_code()
-            data["players"][str(player_id)] = {
-                "country_name": country_name, "region": region,
-                "gold": 1000, "army": 100, "factories": 1, "farms": 1,
-                "territories": 1, "allies": [], "at_war": [],
-                "last_tax": 0, "player_code": player_code, "xp": 0,
-                "facilities": {}, "inventory": {}, "crops": {}, "crops_amount": {},
-                "infrastructure": 0, "capital": "",
-            }
-            save_data(data)
-            await update.message.reply_text(f"✅ تم!\n🏳️ *{country_name}* ← {region}\n🔑 `{player_code}`", parse_mode="Markdown")
-            try: await context.bot.send_message(chat_id=player_id, text=f"🎉 دولتك اتفعّلت!\n🏳️ *{country_name}*\nاكتب *مساعدة*", parse_mode="Markdown")
+            if len(parts)<4:
+                await update.message.reply_text("الصيغة: دولة [المنطقة] [الاسم] [الكود]"); return
+            code=parts[-1].upper(); region=parts[1]; cname=" ".join(parts[2:-1])
+            if code not in data["pending_codes"]: await update.message.reply_text(f"الكود {code} مش موجود."); return
+            if region not in AVAILABLE_REGIONS: await update.message.reply_text(f"'{region}' مش في القائمة."); return
+            for _,pp in data["players"].items():
+                if pp["region"]==region: await update.message.reply_text(f"'{region}' محجوزة."); return
+            pid = data["pending_codes"].pop(code)
+            pl  = new_player(region, cname, pid)
+            data["players"][str(pid)] = pl; save_data(data)
+            await update.message.reply_text(f"✅ *{cname}* ← {region} | كود: `{pl['player_code']}`", parse_mode="Markdown")
+            try: await context.bot.send_message(chat_id=pid, text=f"🎊 *دولتك اتفعّلت!*\n🏳️ *{cname}*\nاكتب *مساعدة*", parse_mode="Markdown")
             except: pass
             return
+
+        # حذف دولة
         if text.startswith("حذف دولة "):
             cname = text.replace("حذف دولة","").strip()
-            for uid, p in list(data["players"].items()):
-                if p["country_name"] == cname:
-                    del data["players"][uid]; save_data(data)
+            for puid,pp in list(data["players"].items()):
+                if pp["country_name"]==cname:
+                    del data["players"][puid]; save_data(data)
                     await update.message.reply_text(f"✅ تم حذف {cname}."); return
             await update.message.reply_text(f"❌ مش لاقي '{cname}'."); return
-        if text in ["الطلبات"]:
-            if not data["pending_codes"]:
-                await update.message.reply_text("✅ مفيش طلبات."); return
-            msg = "📋 *الطلبات:*\n\n" + "\n".join(f"• `{c}` — ID: `{uid}`" for c,uid in data["pending_codes"].items())
+
+        # تحويل ملكية دولة
+        if text.startswith("تحويل ملكية "):
+            # الصيغة: تحويل ملكية [اسم الدولة] الى [كود اللاعب الجديد]
+            parts = text.replace("تحويل ملكية","").strip().split(" الى ")
+            if len(parts)!=2:
+                await update.message.reply_text("الصيغة: تحويل ملكية [اسم الدولة] الى [user_id]"); return
+            cname = parts[0].strip(); new_uid = parts[1].strip()
+            for puid,pp in list(data["players"].items()):
+                if pp["country_name"]==cname:
+                    data["players"][new_uid] = data["players"].pop(puid)
+                    save_data(data)
+                    await update.message.reply_text(f"✅ ملكية {cname} تحولت الى ID: {new_uid}"); return
+            await update.message.reply_text(f"❌ مش لاقي '{cname}'."); return
+
+        # فتح/قفل الحروب
+        if text in ["اقفل الحروب","وقف الحروب"]:
+            data["wars_enabled"] = False
+            save_data(data)
+            await update.message.reply_text("🕊️ *تم إيقاف الحروب!* لا أحد يستطيع الهجوم الآن.", parse_mode="Markdown"); return
+
+        if text in ["افتح الحروب","شغّل الحروب","شغل الحروب"]:
+            data["wars_enabled"] = True
+            save_data(data)
+            await update.message.reply_text("⚔️ *تم فتح الحروب!* يمكن للدول الهجوم الآن.", parse_mode="Markdown"); return
+
+        # الطلبات المعلقة
+        if text == "الطلبات":
+            if not data["pending_codes"]: await update.message.reply_text("✅ مفيش طلبات."); return
+            msg = f"{box_title('📋','طلبات الانضمام')}\n\n"
+            for c,v in data["pending_codes"].items():
+                msg += f"• `{c}` — ID: `{v}`\n"
             await update.message.reply_text(msg, parse_mode="Markdown"); return
 
-# ======= Callback للأزرار =======
+        # اوامر الادمن
+        if text in ["اوامر الادمن","ادمن"]:
+            await update.message.reply_text(
+                f"{box_title('🔧','اوامر الادمن')}\n\n"
+                f"• `دولة [منطقة] [اسم] [كود]` — انشاء دولة\n"
+                f"• `حذف دولة [اسم]` — حذف دولة\n"
+                f"• `تحويل ملكية [اسم] الى [user_id]` — تغيير الملكية\n"
+                f"• `الطلبات` — شوف طلبات الانضمام\n"
+                f"• `اقفل الحروب` / `افتح الحروب`\n"
+                f"• ارسل صورة + `دولة [منطقة] [اسم] [كود]` لاضافة علم",
+                parse_mode="Markdown"); return
+
+# ==================== Callbacks ====================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    data    = load_data()
-    player  = get_player(data, user_id)
+    uid   = query.from_user.id
+    data  = load_data()
+    p     = get_player(data, uid)
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ تم الإلغاء."); return
+        await query.edit_message_text("❌ تم الالغاء."); return
 
-    # قبول عرض التحالف
+    # ---- القرض ----
+    if query.data.startswith("loan_"):
+        loan_id = query.data.replace("loan_","")
+        if not p: await query.edit_message_text("❌ مش مسجل."); return
+        loan_def = next((l for l in LOAN_OPTIONS if l["id"]==loan_id), None)
+        if not loan_def: await query.edit_message_text("❌ قرض غير معروف."); return
+        active = p.get("loans",[])
+        if len(active) >= 2:
+            await query.edit_message_text("❌ عندك 2 قروض بالفعل. سدّد أولاً."); return
+        total_due = int(loan_def["amount"] * (1+loan_def["interest"]))
+        new_loan  = {
+            "id": loan_id,
+            "name": loan_def["name"],
+            "amount": loan_def["amount"],
+            "due": total_due,
+            "remaining_cycles": loan_def["due_cycles"],
+        }
+        data["players"][str(uid)]["gold"]  = p["gold"] + loan_def["amount"]
+        data["players"][str(uid)]["loans"] = active + [new_loan]
+        save_data(data)
+        await query.edit_message_text(
+            f"🏦 *تم صرف القرض!*\n{sep()}\n"
+            f"{loan_def['emoji']} {loan_def['name']}\n"
+            f"💵 المبلغ: +{loan_def['amount']:,}ذ\n"
+            f"💰 رصيدك الآن: {p['gold']+loan_def['amount']:,}ذ\n"
+            f"{sep()}\n"
+            f"📅 السداد: {total_due:,}ذ خلال {loan_def['due_cycles']} دورات حصاد\n"
+            f"⚠️ عدم السداد = عقوبة 50% إضافية!",
+            parse_mode="Markdown")
+        return
+
+    # ---- قبول التحالف ----
     if query.data.startswith("ally_accept_"):
         req_key = query.data.replace("ally_accept_","")
-        reqs    = data.get("alliance_requests", {})
-        req     = reqs.get(req_key)
-        if not req:
-            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
-        from_uid = req["from_uid"]; to_uid = req["to_uid"]
-        from_name = req["from_name"]; to_name = req["to_name"]
-        if from_uid in data["players"]:
-            data["players"][from_uid].setdefault("allies",[])
-            if to_name not in data["players"][from_uid]["allies"]:
-                data["players"][from_uid]["allies"].append(to_name)
-        if to_uid in data["players"]:
-            data["players"][to_uid].setdefault("allies",[])
-            if from_name not in data["players"][to_uid]["allies"]:
-                data["players"][to_uid]["allies"].append(from_name)
+        req     = data.get("alliance_requests",{}).get(req_key)
+        if not req: await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        fu,fn = req["from_uid"], req["from_name"]
+        tu,tn = req["to_uid"],   req["to_name"]
+        for x,y in [(fu,tn),(tu,fn)]:
+            data["players"].setdefault(x,{}).setdefault("allies",[])
+            if y not in data["players"][x]["allies"]:
+                data["players"][x]["allies"].append(y)
         del data["alliance_requests"][req_key]
         save_data(data)
-        await query.edit_message_text(
-            f"✅ *قبلت التحالف مع {from_name}!*\n"
-            f"{'─'*28}\n"
-            f"🤝 أنتما الآن حلفاء رسميون!\n"
-            f"🛡️ لا تستطيعان مهاجمة بعضكما.", parse_mode="Markdown")
+        await query.edit_message_text(f"✅ *قبلت التحالف مع {fn}!*\n🤝 انتما الان حلفاء!", parse_mode="Markdown")
         try:
-            await app_ref.bot.send_message(chat_id=int(from_uid),
-                text=f"🎉 *تم قبول التحالف!*\n{'─'*28}\n"
-                     f"*{to_name}* قبل التحالف معك! 🤝\n"
-                     f"أنتما الآن حلفاء رسميون.", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=int(fu),
+                text=f"🎉 *{tn} قبل التحالف!*\nانتما الان حلفاء رسميون 🤝", parse_mode="Markdown")
         except: pass
         return
 
-    # رفض عرض التحالف
+    # ---- رفض التحالف ----
     if query.data.startswith("ally_reject_"):
         req_key = query.data.replace("ally_reject_","")
-        reqs    = data.get("alliance_requests", {})
-        req     = reqs.get(req_key)
-        if not req:
-            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
-        from_uid  = req["from_uid"]
-        from_name = req["from_name"]
-        to_name   = req["to_name"]
+        req     = data.get("alliance_requests",{}).get(req_key)
+        if not req: await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        fu,fn = req["from_uid"], req["from_name"]
+        tn    = req["to_name"]
         del data["alliance_requests"][req_key]
         save_data(data)
-        await query.edit_message_text(
-            f"❌ *رفضت التحالف مع {from_name}.*", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ رفضت التحالف مع {fn}.")
         try:
-            await app_ref.bot.send_message(chat_id=int(from_uid),
-                text=f"❌ *رُفض عرض التحالف!*\n{'─'*28}\n"
-                     f"*{to_name}* رفض التحالف معك.", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=int(fu),
+                text=f"❌ *{tn} رفض التحالف.*", parse_mode="Markdown")
         except: pass
         return
 
-    # قبول حل الحلف
+    # ---- قبول حل الحلف ----
     if query.data.startswith("dissolve_accept_"):
-        req_key  = query.data.replace("dissolve_accept_","")
-        reqs     = data.get("dissolve_requests", {})
-        req      = reqs.get(req_key)
-        if not req:
-            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
-        from_uid  = req["from_uid"]; to_uid = req["to_uid"]
-        from_name = req["from_name"]; to_name = req["to_name"]
-        if from_uid in data["players"]:
-            data["players"][from_uid]["allies"] = [
-                a for a in data["players"][from_uid].get("allies",[]) if a != to_name]
-        if to_uid in data["players"]:
-            data["players"][to_uid]["allies"] = [
-                a for a in data["players"][to_uid].get("allies",[]) if a != from_name]
+        req_key = query.data.replace("dissolve_accept_","")
+        req     = data.get("dissolve_requests",{}).get(req_key)
+        if not req: await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        fu,fn = req["from_uid"], req["from_name"]
+        tu,tn = req["to_uid"],   req["to_name"]
+        for x,y in [(fu,tn),(tu,fn)]:
+            if x in data["players"]:
+                data["players"][x]["allies"] = [a for a in data["players"][x].get("allies",[]) if a!=y]
         del data["dissolve_requests"][req_key]
         save_data(data)
-        await query.edit_message_text(
-            f"🤝 *تم حل الحلف بالتراضي.*\n{'─'*28}\n"
-            f"الحلف مع *{from_name}* انتهى رسمياً.\n"
-            f"لا عقوبات — تمّ بشكل حضاري ✅", parse_mode="Markdown")
+        await query.edit_message_text(f"🤝 *تم حل الحلف مع {fn} بالتراضي.* ✅", parse_mode="Markdown")
         try:
-            await app_ref.bot.send_message(chat_id=int(from_uid),
-                text=f"🤝 *تم حل الحلف بالتراضي.*\n{'─'*28}\n"
-                     f"*{to_name}* وافق على حل الحلف.\n"
-                     f"لا عقوبات ✅", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=int(fu),
+                text=f"🤝 *{tn} وافق على حل الحلف.* لا عقوبات ✅", parse_mode="Markdown")
         except: pass
         return
 
-    # رفض حل الحلف
+    # ---- رفض حل الحلف ----
     if query.data.startswith("dissolve_reject_"):
-        req_key  = query.data.replace("dissolve_reject_","")
-        reqs     = data.get("dissolve_requests", {})
-        req      = reqs.get(req_key)
-        if not req:
-            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
-        from_uid  = req["from_uid"]
-        from_name = req["from_name"]
-        to_name   = req["to_name"]
+        req_key = query.data.replace("dissolve_reject_","")
+        req     = data.get("dissolve_requests",{}).get(req_key)
+        if not req: await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        fu = req["from_uid"]; tn = req["to_name"]
         del data["dissolve_requests"][req_key]
         save_data(data)
-        await query.edit_message_text(
-            f"❌ *رفضت حل الحلف.*\nالتحالف مستمر. 🤝", parse_mode="Markdown")
+        await query.edit_message_text("❌ رفضت حل الحلف. التحالف مستمر 🤝")
         try:
-            await app_ref.bot.send_message(chat_id=int(from_uid),
-                text=f"❌ *رُفض طلب حل الحلف!*\n{'─'*28}\n"
-                     f"*{to_name}* رفض حل الحلف.\n"
-                     f"التحالف مستمر. 🤝", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=int(fu),
+                text=f"❌ *{tn} رفض حل الحلف.* التحالف مستمر 🤝", parse_mode="Markdown")
         except: pass
         return
 
-    # بناء منشأة صناعية
+    # ---- بناء منشاة صناعية ----
     if query.data.startswith("build_"):
         resource = query.data.replace("build_","")
-        if not player:
-            await query.edit_message_text("❌ مش مسجل."); return
-        if resource not in RESOURCE_FACILITIES:
-            await query.edit_message_text("❌ مورد غير معروف."); return
+        if not p: await query.edit_message_text("❌ مش مسجل."); return
+        if resource not in RESOURCE_FACILITIES: await query.edit_message_text("❌ مورد غير معروف."); return
         f    = RESOURCE_FACILITIES[resource]
         cost = f["base_cost"]
-        if player["gold"] < cost:
-            await query.edit_message_text(f"❌ محتاج {cost:,} ذهب. عندك {player['gold']:,}."); return
-        data["players"][str(user_id)]["gold"] -= cost
-        facs = data["players"][str(user_id)].get("facilities", {})
-        facs[resource] = facs.get(resource, 0) + 1
-        data["players"][str(user_id)]["facilities"] = facs
-        leveled_up, new_lvl = add_xp(data, user_id, 120)
+        if p["gold"] < cost:
+            await query.edit_message_text(f"❌ محتاج {cost:,}ذ. عندك {p['gold']:,}."); return
+        data["players"][str(uid)]["gold"] -= cost
+        facs = data["players"][str(uid)].get("facilities",{})
+        facs[resource] = facs.get(resource,0)+1
+        data["players"][str(uid)]["facilities"] = facs
+        leveled_up, new_lvl = add_xp(data, uid, 120)
         save_data(data)
-        msg = (f"🏭 *تم البناء!*\n{'─'*28}\n"
-               f"{f['emoji']} *{f['name']}*\n\n"
-               f"📦 الإنتاج/دورة: +{f['amount']} {resource}\n"
-               f"💰 الذهب المتبقي: {player['gold']-cost:,}\n"
-               f"⭐ +120 XP")
-        if leveled_up: msg += f"\n🎊 *ترقية!* {new_lvl['name']} {new_lvl['emoji']}"
+        msg = (f"🏭 *تم البناء!*\n{'─'*28}\n{f['emoji']} *{f['name']}*\n"
+               f"📦 +{f['amount']} {resource}/دورة\n💰 {p['gold']-cost:,}ذ متبقي\n⭐+120")
+        if leveled_up: msg += f"\n🎊 {new_lvl['name']} {new_lvl['emoji']}"
         await query.edit_message_text(msg, parse_mode="Markdown")
+        return
 
-    # زراعة محصول
-    elif query.data.startswith("farm_"):
+    # ---- زراعة محصول ----
+    if query.data.startswith("farm_"):
         crop = query.data.replace("farm_","")
-        if not player:
-            await query.edit_message_text("❌ مش مسجل."); return
-        if crop not in FARM_CROPS:
-            await query.edit_message_text("❌ محصول غير معروف."); return
-        fc      = FARM_CROPS[crop]
-        cost    = get_farm_cost(data, crop)
-        if player["gold"] < cost:
-            await query.edit_message_text(f"❌ محتاج {cost:,} ذهب. عندك {player['gold']:,}."); return
-
-        # المحاصيل الطبيعية للمنطقة تنتج أكتر بـ 50%
-        region    = player["region"]
-        preferred = REGION_PREFERRED_CROPS.get(region, [])
-        amount    = fc["amount"]
-        bonus_txt = ""
-        if crop in preferred:
-            amount    = int(amount * 1.5)
-            bonus_txt = " (+50% بونص منطقتك ⭐)"
-
-        data["players"][str(user_id)]["gold"] -= cost
-        crops_inv = data["players"][str(user_id)].get("crops", {})
-        crops_inv[crop] = crops_inv.get(crop, 0) + 1
-        data["players"][str(user_id)]["crops"] = crops_inv
-        # حفظ كمية الإنتاج الفعلية
-        if "crops_amount" not in data["players"][str(user_id)]:
-            data["players"][str(user_id)]["crops_amount"] = {}
-        data["players"][str(user_id)]["crops_amount"][crop] = amount
-
-        leveled_up, new_lvl = add_xp(data, user_id, 70)
+        if not p: await query.edit_message_text("❌ مش مسجل."); return
+        if crop not in FARM_CROPS: await query.edit_message_text("❌ محصول غير معروف."); return
+        fc   = FARM_CROPS[crop]
+        cost = get_farm_cost(data, crop)
+        if p["gold"] < cost:
+            await query.edit_message_text(f"❌ محتاج {cost:,}ذ. عندك {p['gold']:,}."); return
+        preferred = REGION_PREFERRED_CROPS.get(p.get("region",""),[])
+        amount    = int(fc["amount"]*1.5) if crop in preferred else fc["amount"]
+        bonus_txt = " (+50% ⭐)" if crop in preferred else ""
+        data["players"][str(uid)]["gold"] -= cost
+        crops_inv = data["players"][str(uid)].get("crops",{})
+        crops_inv[crop] = crops_inv.get(crop,0)+1
+        data["players"][str(uid)]["crops"] = crops_inv
+        ca = data["players"][str(uid)].get("crops_amount",{})
+        ca[crop] = amount
+        data["players"][str(uid)]["crops_amount"] = ca
+        leveled_up, new_lvl = add_xp(data, uid, 70)
         save_data(data)
-        msg = (f"🌾 *تمت الزراعة!*\n{'─'*28}\n"
-               f"{fc['emoji']} *{fc['name']}*{bonus_txt}\n\n"
-               f"📦 الإنتاج/دورة: +{amount} {crop}\n"
-               f"💰 الذهب المتبقي: {player['gold']-cost:,}\n"
-               f"⭐ +70 XP")
-        if leveled_up: msg += f"\n🎊 *ترقية!* {new_lvl['name']} {new_lvl['emoji']}"
+        msg = (f"🌾 *تمت الزراعة!*\n{'─'*28}\n{fc['emoji']} *{fc['name']}*{bonus_txt}\n"
+               f"📦 {amount}طن/دورة | يُباع تلقائياً\n💰 {p['gold']-cost:,}ذ متبقي\n⭐+70")
+        if leveled_up: msg += f"\n🎊 {new_lvl['name']} {new_lvl['emoji']}"
         await query.edit_message_text(msg, parse_mode="Markdown")
+        return
 
-# ======= /start =======
+# ==================== /start ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     await update.message.reply_text(
-        f"🌍 *أهلاً {name} في لعبة الشرق الأوسط!*\n"
-        f"{sep('═')}\n\n"
-        f"🎮 ابنِ دولتك وطوّرها\n"
-        f"⚔️ جنّد جيوشك واحتلّ الأراضي\n"
-        f"🤝 تحالف مع الدول الأخرى\n"
-        f"🛢️ أنتج الموارد وتاجر بها\n"
-        f"🌪️ تحمّل الكوارث الطبيعية\n"
-        f"⚓ تحكّم في المضائق الاستراتيجية\n\n"
-        f"{sep('─')}\n"
-        f"▶️ للبدء: *انشاء دولة*\n"
-        f"📖 للأوامر: *مساعدة*",
+        f"🌍 *اهلاً {name} في لعبة الشرق الاوسط!*\n{sep('═')}\n\n"
+        f"🎮 ابنِ دولتك وطورها\n⚔️ جند جيوشك واحتل الاراضي\n"
+        f"🤝 تحالف مع الدول الاخرى\n🌾 المحاصيل تُباع تلقائياً!\n"
+        f"⚓ تحكم في مضيق السويس وهرمز وباب المندب\n\n"
+        f"{sep()}\n▶️ *انشاء دولة* | 📖 *مساعدة*",
         parse_mode="Markdown")
 
-# ======= تشغيل =======
-app_ref = None  # reference عالمي
-
+# ==================== main ====================
 def main():
-    global app_ref
     app = Application.builder().token(BOT_TOKEN).build()
-    app_ref = app
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1610,7 +1380,7 @@ def main():
 
     loop = asyncio.get_event_loop()
     loop.create_task(disaster_loop(app))
-    loop.create_task(shipment_loop(app))
+    loop.create_task(harvest_loop(app))
 
     print("✅ البوت شغال!")
     app.run_polling()
