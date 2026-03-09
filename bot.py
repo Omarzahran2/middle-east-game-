@@ -18,8 +18,8 @@ from telegram.ext import (
 )
 
 # ==================== إعدادات ====================
-BOT_TOKEN = "8734935129:AAFq1VOM9BLD415c7rdtBTBw1bmTo--trDO"
-ADMIN_ID = 6396528253  # ضع الـ ID بتاعك هنا
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DATA_FILE = "game_data.json"
 MAP_FILE = "map_base.png"   # صورة الخريطة الأساسية
 FLAGS_DIR = "flags"         # مجلد الأعلام  (flags/مصر.png مثلاً)
