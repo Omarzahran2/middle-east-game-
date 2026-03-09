@@ -31,6 +31,60 @@ FLAG_SIZE_SMALL = 100
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
+# ==================== نظام السكان والأحوال ====================
+def calc_population(player):
+    """السكان بالمليون — حسب المزارع + الغذاء + الأراضي + الاقتصاد"""
+    base       = 1.0  # مليون
+    terr_bonus = player.get("territories", 1) * 0.3
+    # الغذاء: كل حقل زراعي يزيد السكان
+    crops_count = sum(player.get("crops", {}).values())
+    food_bonus  = crops_count * 0.5
+    # الاقتصاد: كل 1000 ذهب = 0.1 مليون
+    econ_bonus  = min(player.get("gold", 0) / 10000, 2.0)
+    # الحروب والكوارث تنقص السكان
+    wars_lost   = player.get("wars_lost", 0) * 0.2
+    disasters   = player.get("disasters_hit", 0) * 0.1
+    pop = max(0.5, base + terr_bonus + food_bonus + econ_bonus - wars_lost - disasters)
+    return round(pop, 1)
+
+def calc_food_security(player):
+    """مستوى الأمن الغذائي 0-100"""
+    crops_count = sum(player.get("crops", {}).values())
+    pop         = calc_population(player)
+    # كل حقل يكفي 0.5 مليون شخص
+    if pop == 0: return 100
+    ratio = (crops_count * 0.5) / pop
+    return min(100, int(ratio * 100))
+
+def calc_health(player):
+    """الصحة العامة 0-100"""
+    base     = 60
+    gold_b   = min(20, player.get("gold", 0) // 500)
+    food_b   = calc_food_security(player) // 5
+    wars_p   = player.get("wars_lost", 0) * 5
+    disas_p  = player.get("disasters_hit", 0) * 3
+    return max(10, min(100, base + gold_b + food_b - wars_p - disas_p))
+
+def calc_happiness(player):
+    """الرضا الاجتماعي 0-100"""
+    base   = 50
+    food_b = calc_food_security(player) // 4
+    econ_b = min(20, player.get("gold", 0) // 1000)
+    wars_p = player.get("wars_lost", 0) * 8
+    allies = len(player.get("allies", [])) * 3
+    traitor= -20 if player.get("traitor") else 0
+    return max(5, min(100, base + food_b + econ_b + allies - wars_p + traitor))
+
+def status_emoji(val):
+    if val >= 80: return "🟢"
+    if val >= 50: return "🟡"
+    if val >= 25: return "🟠"
+    return "🔴"
+
+def bar(val, length=10):
+    filled = int((val / 100) * length)
+    return "█" * filled + "░" * (length - filled)
+
 # ==================== تنسيق الرسائل ====================
 def sep(char="─", n=28):
     return char * n
@@ -123,12 +177,13 @@ RESOURCE_FACILITIES = {
 # ==================== المزارع الزراعية ====================
 # (محاصيل) — تكلفة ديناميكية حسب السوق
 FARM_CROPS = {
-    "قمح":    {"name": "🌾 حقل قمح",       "base_cost": 400,  "amount": 5, "emoji": "🌾"},
-    "أرز":    {"name": "🍚 حقل أرز",       "base_cost": 350,  "amount": 5, "emoji": "🍚"},
-    "فول":    {"name": "🫘 حقل فول",       "base_cost": 300,  "amount": 6, "emoji": "🫘"},
-    "بن":     {"name": "☕ مزرعة بن",      "base_cost": 450,  "amount": 4, "emoji": "☕"},
-    "بطاطس":  {"name": "🥔 حقل بطاطس",    "base_cost": 250,  "amount": 7, "emoji": "🥔"},
-    "زيتون":  {"name": "🫒 بستان زيتون",   "base_cost": 350,  "amount": 5, "emoji": "🫒"},
+    # amount = طن/دورة لحقل واحد (10-50 طن)
+    "قمح":    {"name": "🌾 حقل قمح",       "base_cost": 400,  "amount": 35, "emoji": "🌾"},
+    "أرز":    {"name": "🍚 حقل أرز",       "base_cost": 350,  "amount": 30, "emoji": "🍚"},
+    "فول":    {"name": "🫘 حقل فول",       "base_cost": 300,  "amount": 20, "emoji": "🫘"},
+    "بن":     {"name": "☕ مزرعة بن",      "base_cost": 450,  "amount": 12, "emoji": "☕"},
+    "بطاطس":  {"name": "🥔 حقل بطاطس",    "base_cost": 250,  "amount": 40, "emoji": "🥔"},
+    "زيتون":  {"name": "🫒 بستان زيتون",   "base_cost": 350,  "amount": 15, "emoji": "🫒"},
 }
 
 # الموارد الزراعية المفضلة لكل منطقة (بتظهر أول في القائمة)
@@ -366,6 +421,7 @@ async def disaster_loop(app):
                         loss = max(1, int(inv[res] * pct))
                         data["players"][uid]["inventory"][res] = max(0, inv[res] - loss)
 
+                data["players"][uid]["disasters_hit"] = data["players"][uid].get("disasters_hit",0) + 1
                 data["last_disaster"] = time.time()
                 save_data(data)
 
@@ -976,8 +1032,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
         else:
             la, ld = random.randint(50,200), random.randint(10,50)
-            data["players"][str(user_id)]["army"] = max(0, player["army"]-la)
-            data["players"][target_uid]["army"]   = max(0, target_player["army"]-ld)
+            data["players"][str(user_id)]["army"]      = max(0, player["army"]-la)
+            data["players"][str(user_id)]["wars_lost"]  = player.get("wars_lost",0) + 1
+            data["players"][target_uid]["army"]          = max(0, target_player["army"]-ld)
             save_data(data)
             await update.message.reply_text(
                 f"⚔️ *نتيجة المعركة*\n"
@@ -993,7 +1050,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
-    # ======= تحالف =======
+    # ======= عرض تحالف =======
     if text.startswith("تحالف مع "):
         player = get_player(data, user_id)
         if not player:
@@ -1001,20 +1058,130 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_name = text.replace("تحالف مع","").strip()
         for uid, p in data["players"].items():
             if p["country_name"] == target_name or p["region"] == target_name:
-                if p["country_name"] in player.get("allies",[]): await update.message.reply_text("✅ حليف بالفعل."); return
-                data["players"][str(user_id)]["allies"].append(p["country_name"])
-                data["players"][uid]["allies"].append(player["country_name"]); save_data(data)
+                if p["country_name"] in player.get("allies",[]): 
+                    await update.message.reply_text("✅ دي دولة حليفة بالفعل."); return
+                if uid == str(user_id):
+                    await update.message.reply_text("❌ مينفعش تتحالف مع نفسك!"); return
+                # تخزين طلب التحالف
+                if "alliance_requests" not in data: data["alliance_requests"] = {}
+                req_key = f"{user_id}_{uid}"
+                data["alliance_requests"][req_key] = {
+                    "from_uid": str(user_id), "from_name": player["country_name"],
+                    "to_uid": uid, "to_name": p["country_name"],
+                    "time": time.time()
+                }
+                save_data(data)
                 await update.message.reply_text(
-                    f"🤝 *تحالف جديد!*\n{sep()}\n"
-                    f"تم إبرام تحالف مع *{p['country_name']}* ✅\n"
-                    f"🛡️ لن تستطيع مهاجمة حليفك!", parse_mode="Markdown")
-                try: await context.bot.send_message(chat_id=int(uid),
-                    text=f"🤝 *عرض تحالف!*\n{sep()}\n"
-                         f"*{player['country_name']}* أبرم تحالفاً معك!\n"
-                         f"أنتما الآن حلفاء 🛡️", parse_mode="Markdown")
+                    f"📨 *تم إرسال عرض التحالف!*\n{sep()}\n"
+                    f"إلى: *{p['country_name']}*\n"
+                    f"⏳ في انتظار الموافقة...", parse_mode="Markdown")
+                try:
+                    kbd = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ قبول", callback_data=f"ally_accept_{req_key}"),
+                        InlineKeyboardButton("❌ رفض",  callback_data=f"ally_reject_{req_key}"),
+                    ]])
+                    await context.bot.send_message(chat_id=int(uid),
+                        text=f"🤝 *عرض تحالف جديد!*\n{sep()}\n"
+                             f"*{player['country_name']}* يعرض التحالف معك!\n\n"
+                             f"هل توافق؟",
+                        reply_markup=kbd, parse_mode="Markdown")
                 except: pass
                 return
         await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
+
+    # ======= حل الحلف (بالاتفاق) =======
+    if text.startswith("حل الحلف مع ") or text.startswith("حل حلف مع "):
+        player = get_player(data, user_id)
+        if not player:
+            await update.message.reply_text("❌ مش مسجل."); return
+        target_name = text.replace("حل الحلف مع","").replace("حل حلف مع","").strip()
+        for uid, p in data["players"].items():
+            if p["country_name"] == target_name or p["region"] == target_name:
+                if p["country_name"] not in player.get("allies",[]):
+                    await update.message.reply_text(f"❌ {target_name} مش حليفك أصلاً."); return
+                # لازم موافقة الطرفين — ابعت طلب
+                if "dissolve_requests" not in data: data["dissolve_requests"] = {}
+                req_key = f"{user_id}_{uid}_dissolve"
+                data["dissolve_requests"][req_key] = {
+                    "from_uid": str(user_id), "from_name": player["country_name"],
+                    "to_uid": uid, "to_name": p["country_name"]
+                }
+                save_data(data)
+                await update.message.reply_text(
+                    f"📨 *تم إرسال طلب حل الحلف!*\n{sep()}\n"
+                    f"إلى: *{p['country_name']}*\n"
+                    f"⏳ في انتظار موافقتهم...", parse_mode="Markdown")
+                try:
+                    kbd = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ موافق", callback_data=f"dissolve_accept_{req_key}"),
+                        InlineKeyboardButton("❌ رفض",   callback_data=f"dissolve_reject_{req_key}"),
+                    ]])
+                    await context.bot.send_message(chat_id=int(uid),
+                        text=f"⚠️ *طلب حل الحلف!*\n{sep()}\n"
+                             f"*{player['country_name']}* يطلب حل الحلف معك بالتراضي.\n"
+                             f"هل توافق؟",
+                        reply_markup=kbd, parse_mode="Markdown")
+                except: pass
+                return
+        await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
+
+    # ======= نقض الحلف (بدون موافقة = عقوبات) =======
+    if text.startswith("نقض الحلف مع ") or text.startswith("نقض حلف مع "):
+        player = get_player(data, user_id)
+        if not player:
+            await update.message.reply_text("❌ مش مسجل."); return
+        target_name = text.replace("نقض الحلف مع","").replace("نقض حلف مع","").strip()
+        for uid, p in data["players"].items():
+            if p["country_name"] == target_name or p["region"] == target_name:
+                if p["country_name"] not in player.get("allies",[]):
+                    await update.message.reply_text(f"❌ {target_name} مش حليفك."); return
+                # إزالة التحالف
+                data["players"][str(user_id)]["allies"] = [
+                    a for a in player["allies"] if a != p["country_name"]]
+                data["players"][uid]["allies"] = [
+                    a for a in p.get("allies",[]) if a != player["country_name"]]
+                # عقوبات الخيانة
+                penalty = min(player["gold"] // 4, 1000)
+                data["players"][str(user_id)]["gold"] = max(0, player["gold"] - penalty)
+                data["players"][str(user_id)]["traitor"] = True   # وصمة الخائن
+                save_data(data)
+                await update.message.reply_text(
+                    f"🗡️ *نقضت الحلف مع {p['country_name']}!*\n{sep()}\n"
+                    f"⚠️ *عقوبات الخيانة:*\n"
+                    f"   💸 خسرت: {penalty:,} ذهب\n"
+                    f"   🗡️ لقب *خائن* أُضيف لاسم دولتك\n"
+                    f"   📉 انخفاض في الرضا الاجتماعي\n"
+                    f"{sep()}\n"
+                    f"💡 لإزالة لقب الخائن: `إزالة الخيانة`", parse_mode="Markdown")
+                try:
+                    await context.bot.send_message(chat_id=int(uid),
+                        text=f"🚨 *خيانة!*\n{sep()}\n"
+                             f"*{player['country_name']}* 🗡️خائن نقض الحلف معك!\n"
+                             f"أنت حر الآن في مهاجمتهم ⚔️",
+                        parse_mode="Markdown")
+                except: pass
+                return
+        await update.message.reply_text(f"❌ مش لاقي '{target_name}'."); return
+
+    # ======= إزالة لقب الخائن (بذهب) =======
+    if text in ["إزالة الخيانة", "ازالة الخيانة", "تنظيف السمعة"]:
+        player = get_player(data, user_id)
+        if not player:
+            await update.message.reply_text("❌ مش مسجل."); return
+        if not player.get("traitor"):
+            await update.message.reply_text("✅ دولتك نظيفة ومفيش لقب خيانة."); return
+        cost = 2000
+        if player["gold"] < cost:
+            await update.message.reply_text(
+                f"❌ محتاج {cost:,} ذهب لإزالة لقب الخيانة.\nعندك {player['gold']:,}."); return
+        data["players"][str(user_id)]["gold"] -= cost
+        data["players"][str(user_id)]["traitor"] = False
+        save_data(data)
+        await update.message.reply_text(
+            f"✅ *تم تنظيف سمعة دولتك!*\n{sep()}\n"
+            f"💸 دفعت: {cost:,} ذهب\n"
+            f"🗡️ لقب الخائن أُزيل!", parse_mode="Markdown")
+        return
 
     # ======= تحويل ذهب =======
     if text.startswith("تحويل "):
@@ -1243,6 +1410,110 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "cancel":
         await query.edit_message_text("❌ تم الإلغاء."); return
 
+    # قبول عرض التحالف
+    if query.data.startswith("ally_accept_"):
+        req_key = query.data.replace("ally_accept_","")
+        reqs    = data.get("alliance_requests", {})
+        req     = reqs.get(req_key)
+        if not req:
+            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        from_uid = req["from_uid"]; to_uid = req["to_uid"]
+        from_name = req["from_name"]; to_name = req["to_name"]
+        if from_uid in data["players"]:
+            data["players"][from_uid].setdefault("allies",[])
+            if to_name not in data["players"][from_uid]["allies"]:
+                data["players"][from_uid]["allies"].append(to_name)
+        if to_uid in data["players"]:
+            data["players"][to_uid].setdefault("allies",[])
+            if from_name not in data["players"][to_uid]["allies"]:
+                data["players"][to_uid]["allies"].append(from_name)
+        del data["alliance_requests"][req_key]
+        save_data(data)
+        await query.edit_message_text(
+            f"✅ *قبلت التحالف مع {from_name}!*\n"
+            f"{'─'*28}\n"
+            f"🤝 أنتما الآن حلفاء رسميون!\n"
+            f"🛡️ لا تستطيعان مهاجمة بعضكما.", parse_mode="Markdown")
+        try:
+            await app_ref.bot.send_message(chat_id=int(from_uid),
+                text=f"🎉 *تم قبول التحالف!*\n{'─'*28}\n"
+                     f"*{to_name}* قبل التحالف معك! 🤝\n"
+                     f"أنتما الآن حلفاء رسميون.", parse_mode="Markdown")
+        except: pass
+        return
+
+    # رفض عرض التحالف
+    if query.data.startswith("ally_reject_"):
+        req_key = query.data.replace("ally_reject_","")
+        reqs    = data.get("alliance_requests", {})
+        req     = reqs.get(req_key)
+        if not req:
+            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        from_uid  = req["from_uid"]
+        from_name = req["from_name"]
+        to_name   = req["to_name"]
+        del data["alliance_requests"][req_key]
+        save_data(data)
+        await query.edit_message_text(
+            f"❌ *رفضت التحالف مع {from_name}.*", parse_mode="Markdown")
+        try:
+            await app_ref.bot.send_message(chat_id=int(from_uid),
+                text=f"❌ *رُفض عرض التحالف!*\n{'─'*28}\n"
+                     f"*{to_name}* رفض التحالف معك.", parse_mode="Markdown")
+        except: pass
+        return
+
+    # قبول حل الحلف
+    if query.data.startswith("dissolve_accept_"):
+        req_key  = query.data.replace("dissolve_accept_","")
+        reqs     = data.get("dissolve_requests", {})
+        req      = reqs.get(req_key)
+        if not req:
+            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        from_uid  = req["from_uid"]; to_uid = req["to_uid"]
+        from_name = req["from_name"]; to_name = req["to_name"]
+        if from_uid in data["players"]:
+            data["players"][from_uid]["allies"] = [
+                a for a in data["players"][from_uid].get("allies",[]) if a != to_name]
+        if to_uid in data["players"]:
+            data["players"][to_uid]["allies"] = [
+                a for a in data["players"][to_uid].get("allies",[]) if a != from_name]
+        del data["dissolve_requests"][req_key]
+        save_data(data)
+        await query.edit_message_text(
+            f"🤝 *تم حل الحلف بالتراضي.*\n{'─'*28}\n"
+            f"الحلف مع *{from_name}* انتهى رسمياً.\n"
+            f"لا عقوبات — تمّ بشكل حضاري ✅", parse_mode="Markdown")
+        try:
+            await app_ref.bot.send_message(chat_id=int(from_uid),
+                text=f"🤝 *تم حل الحلف بالتراضي.*\n{'─'*28}\n"
+                     f"*{to_name}* وافق على حل الحلف.\n"
+                     f"لا عقوبات ✅", parse_mode="Markdown")
+        except: pass
+        return
+
+    # رفض حل الحلف
+    if query.data.startswith("dissolve_reject_"):
+        req_key  = query.data.replace("dissolve_reject_","")
+        reqs     = data.get("dissolve_requests", {})
+        req      = reqs.get(req_key)
+        if not req:
+            await query.edit_message_text("❌ انتهت صلاحية الطلب."); return
+        from_uid  = req["from_uid"]
+        from_name = req["from_name"]
+        to_name   = req["to_name"]
+        del data["dissolve_requests"][req_key]
+        save_data(data)
+        await query.edit_message_text(
+            f"❌ *رفضت حل الحلف.*\nالتحالف مستمر. 🤝", parse_mode="Markdown")
+        try:
+            await app_ref.bot.send_message(chat_id=int(from_uid),
+                text=f"❌ *رُفض طلب حل الحلف!*\n{'─'*28}\n"
+                     f"*{to_name}* رفض حل الحلف.\n"
+                     f"التحالف مستمر. 🤝", parse_mode="Markdown")
+        except: pass
+        return
+
     # بناء منشأة صناعية
     if query.data.startswith("build_"):
         resource = query.data.replace("build_","")
@@ -1326,8 +1597,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 # ======= تشغيل =======
+app_ref = None  # reference عالمي
+
 def main():
+    global app_ref
     app = Application.builder().token(BOT_TOKEN).build()
+    app_ref = app
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
