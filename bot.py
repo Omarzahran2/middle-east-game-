@@ -1558,7 +1558,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"  🔒 {w['emoji']} {w['name']}\n     _{lock_why.strip()}_\n"
             else:
                 owned_txt = f" ✅(عندك {owned})" if owned else ""
-                cost_fmt  = f"{w['cost']:,}"
+                cost_fmt = f"{w.get('cost', 0):,}"
                 msg += f"  {w['emoji']} *{w['name']}*{owned_txt}\n"
                 msg += f"     💰 {CUR}{cost_fmt} | _{w['desc']}_\n"
                 msg += f"     🛒 `شراء {wid}`\n"
