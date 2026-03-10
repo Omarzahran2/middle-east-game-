@@ -379,6 +379,7 @@ def get_facility_infra_req(fac_id, region):
 
 
     """تطبيع النص — ة↔ه، همزات، ألف مقصورة"""
+    def norm(t):
     t = t.strip()
     t = t.replace("أ","ا").replace("إ","ا").replace("آ","ا")
     t = t.replace("ة","ه")
